@@ -377,13 +377,13 @@ class MainWindow(mainwindow_cls):
             self.local_workspace.pause_pending = True
             self.local_workspace.finish_job(False, '다른 작업이 실행 중입니다. 완료 후 재시도하세요.', 0, 0)
             return
-        self._sync_local_source_language()
         self._local_save_error = ''
         self._local_presave_errors = self.imsave_thread.error_count
         if self.conditional_save() is False:
             self.local_workspace.pause_pending = True
             self.local_workspace.finish_job(False, f'열려 있는 프로젝트 저장 실패: {self._local_save_error}', 0, 0)
             return
+        self._sync_local_source_language()
         # The previous page's save jobs must finish before replacing project
         # identity or selecting another output destination.
         self._local_pending_folder = folder
