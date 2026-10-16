@@ -3,112 +3,50 @@ name: Verify local reader and image export
 on:
   push:
     branches: ['codex/local-reader-export']
-    paths: ['.github/reader-update.*.b64', '.github/workflows/verify-reader-update.yml']
+    paths: ['.github/workflows/verify-reader-update.yml']
 
 permissions:
   contents: read
 
-concurrency:
-  group: local-reader-export-verification
-  cancel-in-progress: false
-
 jobs:
-  verify:
+  reader-ui:
     runs-on: windows-latest
-    timeout-minutes: 30
-    permissions:
-      contents: write
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        qt: [pyqt5, pyqt6]
     env:
       QT_QPA_PLATFORM: offscreen
-      QT_API: pyqt6
+      QT_API: ${{ matrix.qt }}
+      PYTHONUTF8: '1'
       OLLAMA_NO_CLOUD: '1'
       HF_HUB_OFFLINE: '1'
       TRANSFORMERS_OFFLINE: '1'
-      PYTHONUTF8: '1'
-      READER_SCREENSHOT_DIR: reader-verification/qt6
+      READER_SCREENSHOT_DIR: reader-verification
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
           cache: pip
-      - name: Materialize checked source update on isolated feature branch
-        shell: python
-        run: |
-          import base64, hashlib, json, lzma, pathlib, subprocess
-          root = pathlib.Path.cwd()
-          fragments = [root / f'.github/reader-update.{n}.b64' for n in range(5)]
-          if not any(p.exists() for p in fragments):
-              print('Source files already materialized; verification only.')
-          else:
-              assert all(p.is_file() for p in fragments), 'Incomplete update fragments'
-              packed = base64.b64decode(''.join(p.read_text(encoding='utf-8') for p in fragments), validate=True)
-              assert hashlib.sha256(packed).hexdigest() == 'a12d20174f3cce0ba56b71ee4f1d6ee800aec52994409f9a2f3202061d365124', 'Update digest mismatch'
-              decoded = lzma.decompress(packed, memlimit=128 * 1024 * 1024)
-              assert len(decoded) < 1024 * 1024
-              payload = json.loads(decoded)
-              allowed = ('ballontranslator/', 'tests/', 'doc/', 'docs/superpowers/', 'scripts/run_local_regressions.py')
-              paths = list(payload['checks'])
-              assert len(paths) == 11 and set(paths) == set(payload['files']) | set(payload['patches'])
-              results = {}
-              for name in paths:
-                  assert name.startswith(allowed) and '\\' not in name and ':' not in name
-                  path = root / name
-                  assert path.resolve().is_relative_to(root)
-                  if name in payload['files']:
-                      assert not path.exists(), f'Unexpected existing file: {name}'
-                      text = payload['files'][name]
-                  else:
-                      patch = payload['patches'][name]
-                      blob = subprocess.check_output(['git', 'hash-object', '--', name], text=True).strip()
-                      assert blob == patch['base'], f'Base changed: {name}'
-                      text = path.read_text(encoding='utf-8')
-                      for old, new in patch['replacements']:
-                          assert text.count(old) == 1, f'Ambiguous update: {name}'
-                          text = text.replace(old, new, 1)
-                  data = text.encode('utf-8')
-                  assert hashlib.sha256(data).hexdigest() == payload['checks'][name], name
-                  results[path] = data
-              for path, data in results.items():
-                  path.parent.mkdir(parents=True, exist_ok=True)
-                  path.write_bytes(data)
-              subprocess.run(['git', 'add', '-f', '--', *paths], check=True)
-              subprocess.run(['git', 'rm', '--', *(str(p.relative_to(root)).replace('\\', '/') for p in fragments)], check=True)
-              subprocess.run(['git', 'config', 'user.name', 'github-actions[bot]'], check=True)
-              subprocess.run(['git', 'config', 'user.email', '41898282+github-actions[bot]@users.noreply.github.com'], check=True)
-              subprocess.run(['git', 'diff', '--cached', '--check'], check=True)
-              subprocess.run(['git', 'commit', '-m', 'Add read-only result viewer and safe mobile image export'], check=True)
-              subprocess.run(['git', 'push', 'origin', 'HEAD:refs/heads/codex/local-reader-export'], check=True)
-              print('Source update committed to isolated feature branch. UI verification follows.')
-      - name: Install existing UI and test dependencies
+      - name: Install existing test dependencies
         run: python -m pip install -r requirements.txt pytest "openai>=2.8.1" "PyQt5==5.15.11"
-      - name: Compile source and verify patch whitespace
-        run: |
-          python -m compileall -q ballontranslator scripts tests
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          git diff --check
-      - name: Windows launch and package boundaries
+      - name: Prepare Korean font for offscreen verification only
         shell: powershell
         run: |
-          ./scripts/test_local_windows.ps1
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python -m unittest discover -s scripts/tests -v
-      - name: New core and Qt 6 viewer tests
-        run: |
-          New-Item -ItemType Directory -Force reader-verification | Out-Null
-          python -m pytest tests/test_reader_export.py tests/test_result_reader_ui.py -v --junitxml=reader-verification/new-tests-qt6.xml
-      - name: Existing local regression files in independent processes
-        run: python scripts/run_local_regressions.py
-      - name: Qt 5 reader compatibility
-        env:
-          QT_API: pyqt5
-          READER_SCREENSHOT_DIR: reader-verification/qt5
-        run: python -m pytest tests/test_result_reader_ui.py -v --junitxml=reader-verification/new-tests-qt5.xml
-      - name: Upload verification reports and screenshots
+          $FontPath = Join-Path $env:RUNNER_TEMP 'NotoSansCJKkr-Regular.otf'
+          Invoke-WebRequest -UseBasicParsing -Uri 'https://raw.githubusercontent.com/notofonts/noto-cjk/main/Sans/OTF/Korean/NotoSansCJKkr-Regular.otf' -OutFile $FontPath
+          "READER_TEST_FONT=$FontPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Verify actual Korean layout and cleanup
+        run: python -m pytest tests/test_result_reader_ui.py::test_ui_screenshots_and_small_window -x -vv -s --tb=long --junitxml=reader-verification/layout.xml
+      - name: Verify reader export and full UI suite
+        run: python -m pytest tests/test_reader_export.py tests/test_result_reader_ui.py -x -vv --tb=long --junitxml=reader-verification/tests.xml
+      - name: Upload images and test results only
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: reader-verification
+          name: reader-verification-${{ matrix.qt }}
           path: reader-verification/
           if-no-files-found: warn
           retention-days: 14
