@@ -352,11 +352,18 @@ class OllamaClient:
                 'usage': {'prompt_tokens': final.get('prompt_eval_count', 0),
                           'completion_tokens': final.get('eval_count', 0)}}
 
-    def test_translation(self, stop_event: Optional[threading.Event] = None) -> str:
+    def test_translation(self, stop_event: Optional[threading.Event] = None,
+                         source_language: str = '日本語') -> str:
+        if source_language == 'English':
+            source_name, sample_text = 'English', 'Hello, how are you?'
+        elif source_language == '日本語':
+            source_name, sample_text = 'Japanese', 'こんにちは'
+        else:
+            raise ValueError('지원하지 않는 원문 언어입니다.')
         result = self.chat({
             'model': MODEL_TAG,
-            'messages': [{'role': 'system', 'content': 'Translate Japanese to Korean. Return JSON with one key: translation.'},
-                         {'role': 'user', 'content': 'こんにちは'}],
+            'messages': [{'role': 'system', 'content': f'Translate {source_name} to Korean. Return JSON with one key: translation.'},
+                         {'role': 'user', 'content': sample_text}],
             'response_format': {'type': 'json_schema', 'json_schema': {'schema': {
                 'type': 'object', 'properties': {'translation': {'type': 'string'}},
                 'required': ['translation'], 'additionalProperties': False,

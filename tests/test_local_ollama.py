@@ -448,3 +448,14 @@ def test_malformed_messages_cannot_bypass_inline_image_validation(server, messag
     with pytest.raises(ValueError):
         local_ollama.OllamaClient().chat({'model': local_ollama.MODEL_TAG, 'messages': messages})
     assert server['requests'] == []
+
+
+def test_english_translation_smoke_test_uses_english_input_without_new_model():
+    from unittest.mock import patch
+    from ballontranslator.utils.local_ollama import OllamaClient
+    with patch.object(OllamaClient, 'chat', return_value={'content': '{"translation":"안녕하세요"}'}) as chat:
+        result = OllamaClient().test_translation(source_language='English')
+    assert result == '안녕하세요'
+    payload = chat.call_args.args[0]
+    assert payload['messages'][1]['content'] == 'Hello, how are you?'
+    assert 'English to Korean' in payload['messages'][0]['content']

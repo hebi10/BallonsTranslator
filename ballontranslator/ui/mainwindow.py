@@ -298,10 +298,22 @@ class MainWindow(mainwindow_cls):
         self.local_workspace.raise_()
         self.local_workspace.activateWindow()
 
+    def _sync_local_source_language(self) -> None:
+        """Align a loaded translator with the chosen folder's source language."""
+        if not is_local_edition():
+            return
+        translator = self.module_manager.translator
+        if translator is not None:
+            translator.set_source(pcfg.module.translate_source)
+            translator.set_target('한국어')
+        self.bottomBar.ocr_selector.setSelectedValue(pcfg.module.ocr)
+        self.setTranslatorSelectionFromMetadata(pcfg.module.translator)
+
     def open_local_editor(self, folder: str) -> None:
         if self.conditional_save() is False:
             create_info_dialog('현재 프로젝트를 저장하지 못했습니다. 저장 오류를 해결한 후 다시 열어 주세요.')
             return
+        self._sync_local_source_language()
         self.OpenProj(folder)
         self._local_output_dir = self.local_workspace.queue.output_directory(folder)
         pcfg.imgsave_ext = self.local_workspace.queue.format
@@ -371,6 +383,7 @@ class MainWindow(mainwindow_cls):
             self.local_workspace.pause_pending = True
             self.local_workspace.finish_job(False, f'열려 있는 프로젝트 저장 실패: {self._local_save_error}', 0, 0)
             return
+        self._sync_local_source_language()
         # The previous page's save jobs must finish before replacing project
         # identity or selecting another output destination.
         self._local_pending_folder = folder
