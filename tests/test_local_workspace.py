@@ -133,6 +133,54 @@ class LocalWorkspaceTest(unittest.TestCase):
             self.addCleanup(restored.deleteLater)
             self.assertFalse(restored.visual_context_checkbox.isChecked())
 
+
+    def test_english_source_selection_is_persisted_per_folder_and_preparation(self):
+        from ballontranslator.utils.config import pcfg
+        import copy
+        folder_english = Path(self.tmp.name) / 'english-comic'
+        folder_japanese = Path(self.tmp.name) / 'japanese-comic'
+        folder_english.mkdir()
+        folder_japanese.mkdir()
+        with patch.object(pcfg, 'module', copy.deepcopy(pcfg.module)), patch(
+            'ballontranslator.ui.local_workspace.save_config', return_value=True
+        ):
+            self.dialog.source_combo.setCurrentIndex(self.dialog.source_combo.findData('English'))
+            self.assertEqual(pcfg.module.translate_source, 'English')
+            self.assertEqual(pcfg.module.ocr, 'mit48px')
+            self.dialog.add_folders([str(folder_english)])
+            self.assertEqual(self.dialog.queue.jobs[0]['source_language'], 'English')
+            self.dialog.source_combo.setCurrentIndex(self.dialog.source_combo.findData('日本語'))
+            self.dialog.add_folders([str(folder_japanese)])
+            self.assertEqual(self.dialog.queue.jobs[1]['source_language'], '日本語')
+            restored = LocalJobQueue(self.dialog.queue.path)
+            self.assertEqual([job['source_language'] for job in restored.jobs], ['English', '日本語'])
+            self.assertEqual(self.dialog.table.item(0, 1).text(), '영어')
+            self.assertEqual(self.dialog.table.item(1, 1).text(), '일본어')
+            self.dialog.running = True
+            self.dialog.start_next()
+            self.assertEqual(pcfg.module.translate_source, 'English')
+            self.assertEqual(pcfg.module.ocr, 'mit48px')
+            self.assertFalse(self.dialog.source_combo.isEnabled())
+
+    def test_language_sensitive_model_test_uses_worker_snapshot(self):
+        worker = LocalSetupThread('test', self.dialog, source_language='English')
+        results = []
+        worker.completed.connect(results.append)
+        with patch('ballontranslator.utils.local_ollama.OllamaClient.test_translation', return_value='안녕하세요') as run:
+            worker.run()
+        self.assertEqual(results, ['안녕하세요'])
+        self.assertEqual(run.call_args.kwargs['source_language'], 'English')
+
+    def test_legacy_queue_jobs_default_to_japanese(self):
+        folder = Path(self.tmp.name) / 'old-comic'
+        folder.mkdir()
+        self.dialog.queue.path.write_text(
+            json.dumps({'version': 1, 'jobs': [{'folder': str(folder), 'state': 'pending'}]}),
+            encoding='utf-8',
+        )
+        restored = LocalJobQueue(self.dialog.queue.path)
+        self.assertEqual(restored.jobs[0]['source_language'], '日本語')
+
     def test_readiness_table_shows_all_rows_without_vertical_scrolling(self):
         self.dialog.worker = LocalSetupThread('status', self.dialog)
         self.dialog._last_operation = 'status'
