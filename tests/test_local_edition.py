@@ -59,7 +59,8 @@ def test_old_or_malformed_visual_context_setting_uses_safe_default():
 def test_local_catalog_contains_only_recommended_modules():
     assert local_edition.module_allowed('translator', 'LLMTranslator')
     assert not local_edition.module_allowed('translator', 'google')
-    assert not local_edition.module_allowed('ocr', 'mit48px')
+    assert local_edition.module_allowed('ocr', 'mit48px')
+    assert not local_edition.module_allowed('ocr', 'google_lens')
     assert not local_edition.module_allowed('inpainter', 'LLMInpaint')
 
 
@@ -80,7 +81,7 @@ from ballontranslator.modules import GET_VALID_TRANSLATORS, GET_VALID_OCR, GET_V
 print(json.dumps([GET_VALID_TRANSLATORS(), GET_VALID_OCR(), GET_VALID_INPAINTERS(), TRANSLATORS.get_spec('LLMTranslator').dependencies]))
 '''], text=True, capture_output=True, check=True)
     assert json.loads(result.stdout.strip().splitlines()[-1]) == [
-        ['LLMTranslator'], ['manga_ocr'], ['lama_large_512px'], []]
+        ['LLMTranslator'], ['manga_ocr', 'mit48px'], ['lama_large_512px'], []]
 
 
 def test_local_requester_uses_native_client_without_openai():
@@ -118,3 +119,55 @@ def test_local_edition_rejects_image_generation_before_selecting_a_profile():
     ), pytest.raises(ImageGenerationBackendUnavailable, match='로컬'):
         create_image_generation_backend(ImageGenerationRecipe())
 
+
+
+def test_english_profile_selects_mit_ocr_and_reuses_qwen_model():
+    from ballontranslator.utils.config import ModuleConfig
+    config = ProgramConfig()
+    local_edition.apply_local_profile(config)
+    config.module.translate_source = 'English'
+    local_edition.apply_local_profile(config)
+    assert config.module.translate_source == 'English'
+    assert config.module.translate_target == '한국어'
+    assert config.module.ocr == 'mit48px'
+    assert config.module.llm_profiles[0].model == local_edition.MODEL_TAG
+    assert 'English comic dialogue' in config.module.llm_profiles[0].prompt
+    config.module = ModuleConfig(**config.module.get_saving_params())
+    local_edition.apply_local_profile(config)
+    assert config.module.translate_source == 'English'
+    assert config.module.ocr == 'mit48px'
+    config.module.translate_source = '日本語'
+    local_edition.apply_local_profile(config)
+    assert config.module.ocr == 'manga_ocr'
+    assert 'Japanese comic dialogue' in config.module.llm_profiles[0].prompt
+
+
+def test_invalid_source_falls_back_to_japanese_and_custom_prompt_is_retained():
+    config = ProgramConfig()
+    local_edition.apply_local_profile(config)
+    config.module.llm_profiles[0].prompt = 'Custom character glossary instructions.'
+    config.module.translate_source = 'English'
+    local_edition.apply_local_profile(config)
+    assert config.module.llm_profiles[0].prompt == 'Custom character glossary instructions.'
+    config.module.translate_source = 'invalid'
+    local_edition.apply_local_profile(config)
+    assert config.module.translate_source == '日本語'
+    assert config.module.ocr == 'manga_ocr'
+
+
+def test_readiness_checks_only_selected_ocr(monkeypatch):
+    from ballontranslator.utils.config import pcfg
+    monkeypatch.setattr(pcfg.module, 'translate_source', 'English')
+    checked = []
+    def fake_present(spec):
+        checked.append(spec.key)
+        return False
+    with patch('ballontranslator.utils.local_edition._model_files_present', side_effect=fake_present):
+        rows = local_edition.local_readiness()
+    assert len(rows) == 4
+    assert '영어 인식' in rows[1][0]
+    assert 'mit48px' in checked
+    assert 'manga_ocr' not in checked
+    with patch('ballontranslator.utils.local_edition._model_files_present', return_value=False):
+        rows_ja = local_edition.local_readiness('日本語')
+    assert '일본어 인식' in rows_ja[1][0]
