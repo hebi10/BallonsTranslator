@@ -8,7 +8,8 @@ import pytest
 from PIL import Image
 
 pytest.importorskip('qtpy')
-from qtpy.QtCore import Qt, QTimer
+from qtpy.QtCore import Qt, QTimer, QCoreApplication, QEvent
+from qtpy.QtGui import QFontDatabase, QFont, QFontMetrics
 from qtpy.QtWidgets import QApplication
 
 from ballontranslator.utils.reader_export import Book, inspect_page, ReaderHistory
@@ -18,7 +19,15 @@ from ballontranslator.ui.image_merge_dialog import ImageMergeDialog
 
 @pytest.fixture(scope='module')
 def app():
-    return QApplication.instance() or QApplication([])
+    application = QApplication.instance() or QApplication([])
+    font_path = os.environ.get('READER_TEST_FONT')
+    if font_path:
+        font_id = QFontDatabase.addApplicationFont(font_path)
+        assert font_id >= 0, 'Test font could not be loaded'
+        family = QFontDatabase.applicationFontFamilies(font_id)[0]
+        application.setFont(QFont(family, 10))
+        assert QFontMetrics(application.font()).inFontUcs4(ord('한'))
+    return application
 
 
 def until(app, predicate, timeout=8):
@@ -140,17 +149,27 @@ def test_ui_screenshots_and_small_window(app, book, tmp_path):
     root = Path(os.environ.get('READER_SCREENSHOT_DIR', str(tmp_path)))
     root.mkdir(parents=True, exist_ok=True)
     d = ReaderDialog(book, ReaderHistory(tmp_path / 'h.json'))
-    d.resize(1000, 720); d.show(); until(app, lambda: bool(d.canvas.cache))
-    assert d.grab().save(str(root / 'reader.png'))
-    d.resize(760, 560); app.processEvents()
-    assert d.layout().minimumSize().width() <= d.width()
-    close_reader(app, d)
-    m = ImageMergeDialog(book); m.resize(1050, 760); m.show()
-    until(app, lambda: m.preview_ready)
-    assert m.grab().save(str(root / 'image-export.png'))
-    m.resize(800, 620); app.processEvents()
-    assert m.layout().minimumSize().width() <= m.width()
-    close_merge(app, m)
+    try:
+        d.resize(1000, 720); d.show(); until(app, lambda: bool(d.canvas.cache))
+        assert d.grab().save(str(root / 'reader.png'))
+        d.resize(760, 560); app.processEvents()
+        assert d.grab().save(str(root / 'reader-small.png'))
+        print('reader sizing', d.width(), d.layout().minimumSize().width(), app.font().toString())
+        assert d.layout().minimumSize().width() <= d.width()
+    finally:
+        close_reader(app, d)
+    m = ImageMergeDialog(book)
+    try:
+        m.resize(1050, 760); m.show()
+        until(app, lambda: m.preview_ready)
+        assert m.grab().save(str(root / 'image-export.png'))
+        m.resize(800, 620); app.processEvents()
+        assert m.grab().save(str(root / 'image-export-small.png'))
+        print('export sizing', m.width(), m.layout().minimumSize().width())
+        assert m.layout().minimumSize().width() <= m.width()
+    finally:
+        close_merge(app, m)
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
 
 
 def test_workspace_has_guarded_reader_entry_points(app, tmp_path):
