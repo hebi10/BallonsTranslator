@@ -28,6 +28,7 @@ from .custom_widget import Widget, SeparatorWidget, PaintQSlider, ColorPickerLab
 from .canvas import Canvas
 from .misc import ndarray2pixmap, themed_icon_path
 from ballontranslator.utils.config import DrawPanelConfig, pcfg
+from ballontranslator.utils.local_edition import is_local_edition
 from ballontranslator.utils.llm_profiles import LLMProfile, LLM_INPAINT_KEY, profile_by_id
 from ballontranslator.utils.shared import CONFIG_COMBOBOX_SHORT, CONFIG_COMBOBOX_HEIGHT
 from ballontranslator.utils.logger import logger as LOGGER
@@ -604,6 +605,13 @@ class RectPanel(Widget):
         self.btnlayout = QHBoxLayout()
         self.btnlayout.addWidget(self.inpaint_btn)
         self.btnlayout.addWidget(self.delete_btn)
+        self.rework_hint = QLabel(self.tr('드래그로 말풍선 전체를 선택한 뒤 재작업하세요. 선택 영역의 수정 내용은 새 결과로 바뀝니다.'))
+        self.rework_hint.setWordWrap(True)
+        self.rework_btn = QPushButton(self.tr('선택 영역 재작업'))
+        self.rework_btn.setMinimumHeight(44)
+        self.rework_btn.setEnabled(False)
+        self.rework_btn.hide()
+        self.rework_hint.hide()
 
         self.inpainter_selector = InpainterSelectorRow(self)
 
@@ -620,7 +628,20 @@ class RectPanel(Widget):
         layout.addLayout(glayout)
         layout.addWidget(self.inpainter_selector.prompt_panel)
         layout.addLayout(self.btnlayout)
+        layout.addWidget(self.rework_hint)
+        layout.addWidget(self.rework_btn)
         layout.setSpacing(14)
+
+    def set_rework_mode(self, enabled: bool) -> None:
+        for control in (self.inpainter_selector, self.inpainter_selector.prompt_panel,
+                        self.autoChecker, self.use_mask_checker, self.methodComboBox):
+            control.setVisible(not enabled)
+        self.inpaint_btn.setVisible(not enabled and not self.auto())
+        self.delete_btn.setVisible(enabled or not self.auto())
+        self.delete_btn.setText(self.tr('선택 취소') if enabled else self.tr('Delete'))
+        self.rework_hint.setVisible(enabled)
+        self.rework_btn.setVisible(enabled)
+        self.rework_btn.setEnabled(False)
 
     def on_inpaint_seg_method_changed(self) -> None:
         pcfg.drawpanel.rectool_method = self.methodComboBox.currentIndex()
@@ -662,6 +683,7 @@ class DrawingPanel(Widget):
 
     scale_tool_pos: QPointF = None
     inpainter_config_requested = Signal()
+    region_rework_requested = Signal(object)
 
     def __init__(self, canvas: Canvas, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -670,11 +692,15 @@ class DrawingPanel(Widget):
         self.canvas = canvas
         self.inpaint_stroke: StrokeImgItem = None
         self.rect_inpaint_dict: dict = None
+        self.region_rework_mode = False
+        self.region_rework_rect: tuple[int, int, int, int] | None = None
         self.inpaint_mask_array: np.ndarray = None
         self.extracted_imask_array: np.ndarray = None
 
         border_pen = QPen(INPAINT_BRUSH_COLOR, 3, Qt.PenStyle.DashLine)
         self.inpaint_mask_item: PixmapItem = PixmapItem(border_pen)
+        # Selection and mask previews are editing guides, never output pixels.
+        self.inpaint_mask_item.setData(CONTROL_ITEM_DATA_KEY, True)
         self.scale_circle = QGraphicsEllipseItem()
         self.magic_wand_preview_item = QGraphicsPixmapItem()
         self.magic_wand_preview_item.setData(CONTROL_ITEM_DATA_KEY, True)
@@ -740,6 +766,7 @@ class DrawingPanel(Widget):
         self.rectPanel.delete_btn_clicked.connect(self.on_rect_deletebtn_clicked)
         self.rectPanel.dilate_ksize_changed.connect(self.on_rectool_ksize_changed)
         self.rectPanel.mask_changed.connect(self._update_rect_mask)
+        self.rectPanel.rework_btn.clicked.connect(self.submit_region_rework)
         for selector_row in self._inpainter_selector_rows():
             selector_row.selection_changed.connect(self.refreshInpainterSelection)
             selector_row.prompt_changed.connect(self.refreshInpainterSelection)
@@ -776,6 +803,12 @@ class DrawingPanel(Widget):
         toolboxlayout.addWidget(self.penTool)
         toolboxlayout.addWidget(self.rectTool)
         toolboxlayout.addWidget(self.shapeTool)
+        self.region_rework_btn = QPushButton(self.tr('영역 재작업'))
+        self.region_rework_btn.setMinimumHeight(44)
+        self.region_rework_btn.setToolTip(self.tr('직접 선택한 영역만 다시 인식·번역하고 배경을 복원합니다.'))
+        self.region_rework_btn.setVisible(is_local_edition())
+        self.region_rework_btn.clicked.connect(self.begin_region_rework)
+        toolboxlayout.addWidget(self.region_rework_btn)
 
         self.canvas.painting_pen = self.pentool_pen = \
             QPen(Qt.GlobalColor.black, 1, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
@@ -1103,6 +1136,8 @@ class DrawingPanel(Widget):
         self._sync_magic_wand_hover_tracking()
 
     def on_use_recttool(self) -> None:
+        self.region_rework_mode = False
+        self.rectPanel.set_rework_mode(False)
         if self.currentTool is not None and self.currentTool != self.rectTool:
             self.currentTool.setChecked(False)
         self.currentTool = self.rectTool
@@ -1112,6 +1147,21 @@ class DrawingPanel(Widget):
         self.canvas.image_edit_mode = ImageEditMode.RectTool
         self.setCrossCursor()
         self._sync_magic_wand_hover_tracking()
+
+    def begin_region_rework(self) -> None:
+        self.clearInpaintItems()
+        self.rectTool.setChecked(True)
+        self.on_use_recttool()
+        self.region_rework_mode = True
+        self.rectPanel.set_rework_mode(True)
+
+    def submit_region_rework(self) -> None:
+        rect = self.region_rework_rect
+        if not self.region_rework_mode or rect is None:
+            return
+        self.clearInpaintItems()
+        self.canvas.image_edit_mode = ImageEditMode.RectTool
+        self.region_rework_requested.emit(rect)
 
     def on_use_shapetool(self) -> None:
         if self.currentTool is not None and self.currentTool != self.shapeTool:
@@ -1485,6 +1535,25 @@ class DrawingPanel(Widget):
 
     def on_end_create_rect(self, rect: QRectF, mode: int) -> None:
         if self.currentTool == self.rectTool:
+            if self.region_rework_mode:
+                self.clearInpaintItems()
+                self.canvas.image_edit_mode = ImageEditMode.RectTool
+                image = self.canvas.imgtrans_proj.img_array
+                if image is None or mode != 0:
+                    return
+                height, width = image.shape[:2]
+                bounds = rect.normalized().intersected(QRectF(0, 0, width, height)).toAlignedRect()
+                if bounds.width() < 2 or bounds.height() < 2:
+                    return
+                self.region_rework_rect = (bounds.x(), bounds.y(),
+                                           bounds.x() + bounds.width(), bounds.y() + bounds.height())
+                preview = np.full((bounds.height(), bounds.width(), 4), (100, 100, 100, 55), np.uint8)
+                self.inpaint_mask_item.setPixmap(ndarray2pixmap(preview))
+                self.inpaint_mask_item.setParentItem(self.canvas.baseLayer)
+                self.inpaint_mask_item.setPos(bounds.x(), bounds.y())
+                self.rectPanel.rework_btn.setEnabled(True)
+                self.setCrossCursor()
+                return
             self.canvas.image_edit_mode = ImageEditMode.NONE
             img = self.canvas.imgtrans_proj.inpainted_array
             im_h, im_w = img.shape[:2]
@@ -1621,6 +1690,9 @@ class DrawingPanel(Widget):
     def clearInpaintItems(self) -> None:
 
         self.rect_inpaint_dict = None
+        self.region_rework_rect = None
+        if hasattr(self, 'rectPanel'):
+            self.rectPanel.rework_btn.setEnabled(False)
         self.inpaint_mask_array = None
         if self.inpaint_mask_item is not None:
             if self.inpaint_mask_item.scene() == self.canvas:

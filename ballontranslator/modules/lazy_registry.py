@@ -888,6 +888,7 @@ def init_lazy_module_registries(target_modules=None):
     """
 
     from . import MODULETYPE_TO_REGISTRIES
+    from ballontranslator.utils.local_edition import is_local_edition, module_allowed
 
     def _targets(target_modules=None):
         if target_modules is None:
@@ -903,6 +904,12 @@ def init_lazy_module_registries(target_modules=None):
         for path in _module_files(module_type):
             try:
                 for spec in _scan_file(path, module_type):
+                    if is_local_edition():
+                        if not module_allowed(module_type, spec.key):
+                            continue
+                        if module_type == 'translator':
+                            # Native loopback HTTP and deterministic token estimation need no API SDK.
+                            spec.dependencies = []
                     registry.register_lazy_module(spec)
                     if _is_custom_module_file(path):
                         LOGGER.info(f'Discovered custom {module_type} module "{spec.key}" from {path}')

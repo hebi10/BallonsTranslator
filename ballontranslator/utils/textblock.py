@@ -751,7 +751,10 @@ class TextBlock:
         return True
 
 
-def sort_regions(regions: List[TextBlock], right_to_left=None) -> List[TextBlock]:
+def sort_regions(
+    regions: List[TextBlock], right_to_left: Optional[bool] = None,
+    japanese_vertical_overlap: bool = False,
+) -> List[TextBlock]:
     # from manga image translator
     # Sort regions from right to left, top to bottom
     
@@ -765,7 +768,30 @@ def sort_regions(regions: List[TextBlock], right_to_left=None) -> List[TextBlock
     
     sorted_regions = []
     for region in sorted(regions, key=lambda region: region.center()[1]):
+        first_column_index = 0
+        if japanese_vertical_overlap and right_to_left:
+            # Overlap is not transitive: an A/B/C chain must not move C above
+            # a wholly disjoint A just because both overlap the tall B.
+            first_column_index = max(
+                (i + 1 for i, previous in enumerate(sorted_regions)
+                 if previous.xyxy[3] <= region.xyxy[1]), default=0,
+            )
         for i, sorted_region in enumerate(sorted_regions):
+            if i < first_column_index:
+                continue
+            if japanese_vertical_overlap and right_to_left and region.vertical and sorted_region.vertical:
+                overlap = min(region.xyxy[3], sorted_region.xyxy[3]) - max(region.xyxy[1], sorted_region.xyxy[1])
+                height = min(region.xyxy[3] - region.xyxy[1], sorted_region.xyxy[3] - sorted_region.xyxy[1])
+                separate_columns = (region.xyxy[0] >= sorted_region.xyxy[2]
+                                    or sorted_region.xyxy[0] >= region.xyxy[2])
+                if separate_columns and height > 0 and overlap >= height * 0.4:
+                    # Tall Japanese balloons can overlap without either center
+                    # lying in the other box. This is a column heuristic, not
+                    # panel recognition; disjoint rows retain the legacy order.
+                    if region.center()[0] > sorted_region.center()[0]:
+                        sorted_regions.insert(i, region)
+                        break
+                    continue
             if region.center()[1] > sorted_region.xyxy[3]:
                 continue
             if region.center()[1] < sorted_region.xyxy[1]:
@@ -822,9 +848,70 @@ def examine_textblk(blk: TextBlock, im_w: int, im_h: int, sort: bool = False) ->
     if sort:
         blk.sort_lines()
 
-def try_merge_textline(blk: TextBlock, blk2: TextBlock, fntsize_tol=1.7, distance_tol=2, canvas=None) -> bool:
+def _closed_balloon_regions(
+    canvas: Optional[np.ndarray], blocks: List[TextBlock],
+) -> Dict[int, Set[int]]:
+    """Collect strong enclosed-white-region evidence once per detection page.
+
+    Open, dark, clipped, or glyph-sized regions provide no evidence. A region
+    must cover most of a detected polygon and extend beyond its dimensions;
+    this avoids interpreting small enclosed character counters as balloons.
+    No closing/dilation invents a boundary across an open balloon.
+
+    >>> _closed_balloon_regions(None, [])
+    {}
+    """
+    if canvas is None or not blocks or canvas.dtype != np.uint8:
+        return {}
+    if canvas.ndim == 2:
+        gray = canvas
+    elif canvas.ndim == 3 and canvas.shape[2] in (3, 4):
+        gray = cv2.cvtColor(canvas[:, :, :3], cv2.COLOR_BGR2GRAY)
+    else:
+        return {}
+    height, width = gray.shape
+    _, white = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
+    _, labels, stats, _ = cv2.connectedComponentsWithStats(white, connectivity=8)
+    regions: Dict[int, Set[int]] = {}
+    for block in blocks:
+        for polygon in block.lines:
+            polygon = np.asarray(polygon, dtype=np.int32)
+            x1, y1 = np.maximum(polygon.min(axis=0), 0)
+            x2, y2 = np.minimum(polygon.max(axis=0) + 1, [width, height])
+            if x2 <= x1 or y2 <= y1:
+                continue
+            # Work on each line's clipped ROI once, never on an image per pair.
+            polygon_mask = np.zeros((y2 - y1, x2 - x1), dtype=np.uint8)
+            cv2.fillPoly(polygon_mask, [polygon - [x1, y1]], 1)
+            samples = labels[y1:y2, x1:x2][polygon_mask != 0]
+            if samples.size == 0:
+                continue
+            ids, counts = np.unique(samples, return_counts=True)
+            winner = int(np.argmax(counts))
+            region_id = int(ids[winner])
+            if region_id == 0 or counts[winner] < samples.size * 0.65:
+                continue
+            rx, ry, rw, rh, area = stats[region_id]
+            if rx == 0 or ry == 0 or rx + rw >= width or ry + rh >= height:
+                continue
+            if rw < (x2 - x1) * 1.1 or rh < (y2 - y1) * 1.05 or area < samples.size * 1.2:
+                continue
+            regions.setdefault(id(block), set()).add(region_id)
+    return regions
+
+
+def try_merge_textline(
+    blk: TextBlock, blk2: TextBlock, fntsize_tol=1.7, distance_tol=2,
+    canvas=None, local_bubble_grouping: bool = False,
+    balloon_regions: Optional[Dict[int, Set[int]]] = None,
+) -> bool:
     if blk2.merged:
         return False
+    if local_bubble_grouping and balloon_regions:
+        first_regions = balloon_regions.get(id(blk), set())
+        second_regions = balloon_regions.get(id(blk2), set())
+        if first_regions and second_regions and len(first_regions | second_regions) > 1:
+            return False
     fntsize_div = blk.font_size / blk2.font_size
     num_l1, num_l2 = len(blk), len(blk2)
     fntsz_avg = (blk.font_size * num_l1 + blk2.font_size * num_l2) / (num_l1 + num_l2)
@@ -845,7 +932,7 @@ def try_merge_textline(blk: TextBlock, blk2: TextBlock, fntsize_tol=1.7, distanc
     h2 = xyxy2[3] - xyxy2[1] 
 
     l1, l2 = Polygon(blk.lines[-1]), Polygon(blk2.lines[0])
-    if not l1.intersects(l2):
+    if local_bubble_grouping or not l1.intersects(l2):
         if blk.vertical:
             if distance_y > 0:
                 return False
@@ -881,9 +968,17 @@ def try_merge_textline(blk: TextBlock, blk2: TextBlock, fntsize_tol=1.7, distanc
     blk.distance = np.append(blk.distance, blk2.distance[-1])
     blk.font_size = fntsz_avg
     blk2.merged = True
+    if local_bubble_grouping and balloon_regions is not None:
+        # Keep earlier evidence when an unclassified line joins a block: it
+        # must not become a bridge between two different enclosed balloons.
+        balloon_regions.setdefault(id(blk), set()).update(balloon_regions.get(id(blk2), set()))
     return True
 
-def merge_textlines(blk_list: List[TextBlock], canvas=None, fntsize_tol=1.7) -> List[TextBlock]:
+def merge_textlines(
+    blk_list: List[TextBlock], canvas=None, fntsize_tol=1.7,
+    local_bubble_grouping: bool = False,
+    balloon_regions: Optional[Dict[int, Set[int]]] = None,
+) -> List[TextBlock]:
     if len(blk_list) < 2:
         return blk_list
     merged_list = []
@@ -891,7 +986,11 @@ def merge_textlines(blk_list: List[TextBlock], canvas=None, fntsize_tol=1.7) -> 
         if current_blk.merged:
             continue
         for jj, blk in enumerate(blk_list[ii+1:]):
-            try_merge_textline(current_blk, blk, canvas=canvas, fntsize_tol=fntsize_tol)
+            try_merge_textline(
+                current_blk, blk, canvas=canvas, fntsize_tol=fntsize_tol,
+                local_bubble_grouping=local_bubble_grouping,
+                balloon_regions=balloon_regions,
+            )
         merged_list.append(current_blk)
     for blk in merged_list:
         blk.adjust_bbox(with_bbox=False)
@@ -928,7 +1027,10 @@ def split_textblk(blk: TextBlock):
             current_blk.adjust_bbox(with_bbox=False)
     return textblock_splitted, sub_blk_list
 
-def group_output(blks, lines, im_w, im_h, mask=None, sort_blklist=True, canvas=None) -> List[TextBlock]:
+def group_output(
+    blks, lines, im_w, im_h, mask=None, sort_blklist=True, canvas=None,
+    local_bubble_grouping: bool = False,
+) -> List[TextBlock]:
     blk_list: List[TextBlock] = []
     scattered_lines = {'ver': [], 'hor': []}
     for bbox, cls, conf in zip(*blks):
@@ -1011,15 +1113,26 @@ def group_output(blks, lines, im_w, im_h, mask=None, sort_blklist=True, canvas=N
     scattered_lines['hor'].sort(key=lambda blk: blk.center()[1])
     # c = visualize_textblocks(canvas, scattered_lines['hor'])
     # cv2.imwrite('local_tst.jpg', c)
-    final_blk_list += merge_textlines(scattered_lines['hor'], canvas=canvas, fntsize_tol=2.0)
-    final_blk_list += merge_textlines(scattered_lines['ver'])
+    balloon_regions = (_closed_balloon_regions(canvas, scattered_lines['hor'] + scattered_lines['ver'])
+                       if local_bubble_grouping else None)
+    final_blk_list += merge_textlines(
+        scattered_lines['hor'], canvas=canvas, fntsize_tol=2.0,
+        local_bubble_grouping=local_bubble_grouping, balloon_regions=balloon_regions,
+    )
+    final_blk_list += merge_textlines(
+        scattered_lines['ver'], local_bubble_grouping=local_bubble_grouping,
+        balloon_regions=balloon_regions,
+    )
     if sort_blklist:
-        final_blk_list = sort_regions(final_blk_list, )
+        final_blk_list = sort_regions(final_blk_list, japanese_vertical_overlap=local_bubble_grouping)
     for blk in final_blk_list:
         blk.distance = None
 
 
-    if len(final_blk_list) > 1:
+    # Once an incompatible/independently enclosed detection was retained, its
+    # box being contained in another box is not evidence that its text is a
+    # duplicate. Preserve every accepted line in the guarded local path.
+    if len(final_blk_list) > 1 and not local_bubble_grouping:
         _final_blks = [final_blk_list[0]]
         for blk in final_blk_list[1:]:
             ax1, ay1, ax2, ay2 = blk.xyxy

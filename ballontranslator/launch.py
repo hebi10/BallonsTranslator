@@ -99,7 +99,7 @@ parser.add_argument(
     "--config",
     "--config_path",
     dest="config_path",
-    default=shared.CONFIG_PATH,
+    default=osp.join(shared.PROGRAM_PATH, 'config', 'hebi-local.json'),
     help='Config file to use for translation',
 )
 if "--headless_continuous" in sys.argv[1:]:
@@ -211,6 +211,9 @@ def core_requirements_env(config_path: str) -> dict:
 
 def main():
 
+    from ballontranslator.utils.local_edition import activate_local_edition, apply_local_profile
+    activate_local_edition()
+
     if args.debug:
         os.environ['BALLOONTRANS_DEBUG'] = '1'
 
@@ -230,10 +233,8 @@ def main():
     preload_msvc_runtime()
 
     from ballontranslator.utils.logger import setup_logging, logger as LOGGER
-    from ballontranslator.utils.network_mirrors import auto_fill_network_mirrors
     setup_logging(shared.LOGGING_PATH)
     ensure_resource_theme_files(APP_DIR, LOGGER)
-    updated_mirrors = auto_fill_network_mirrors(args.config_path, LOGGER)
 
     from ballontranslator.utils.core_requirements import ensure_core_requirements
     if ensure_core_requirements(APP_DIR, env=core_requirements_env(args.config_path)):
@@ -251,6 +252,7 @@ def main():
     shared.load_cache()
     program_config.load_config(args.config_path)
     config = program_config.pcfg
+    apply_local_profile(config)
 
     if args.headless:
         config.module.empty_runcache = False
@@ -290,7 +292,7 @@ def main():
     if args.headless:
         app_args = sys.argv + ['-platform', 'offscreen']
     app = QApplication(app_args)
-    app.setApplicationName('BalloonsTranslator')
+    app.setApplicationName('해비 만화 번역기')
     app.setApplicationVersion(APP_VERSION)
 
     if not args.headless:
@@ -400,11 +402,6 @@ def main():
                 0,
                 lambda: FramelessMoveResize.maximize(ballontrans),
             )
-    if updated_mirrors:
-        create_info_dialog(QApplication.translate(
-            'NetworkMirrors',
-            'Network mirrors were selected automatically for better access to dependencies and model downloads.',
-        ))
     # Let this frame release Qt objects before SIP's interpreter-exit cleanup.
     return app.exec()
 

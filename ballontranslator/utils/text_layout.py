@@ -4,6 +4,49 @@ import numpy as np
 from .imgproc_utils import rotate_image
 from .textblock import TextBlock, TextAlignment
 
+
+def centered_mask_rectangles(mask: np.ndarray, center: Tuple[int, int]) -> List[Tuple[int, int, int, int]]:
+    """Return at most seven contained rectangles around a dialogue's center.
+
+    These are conservative, axis-aligned candidates, not estimates of an
+    entire balloon's area. Every included pixel belongs to the supplied safe
+    mask; empty strips and centers outside the mask yield no candidates.
+
+    >>> centered_mask_rectangles(np.ones((10, 10), dtype=bool), (5, 5))[0]
+    (0, 0, 10, 10)
+    """
+    if mask.ndim != 2 or not mask.size:
+        return []
+    cx, cy = center
+    height, width = mask.shape
+    if not (0 <= cx < width and 0 <= cy < height and mask[cy, cx]):
+        return []
+    row = mask[cy].astype(bool)
+    left_invalid = np.flatnonzero(~row[:cx])
+    right_invalid = np.flatnonzero(~row[cx:])
+    left = int(left_invalid[-1] + 1) if left_invalid.size else 0
+    right = int(cx + right_invalid[0]) if right_invalid.size else width
+    half_width = min(cx - left, right - cx)
+    candidates = []
+    for ratio in (1.0, .9, .8, .7, .6, .5, .4):
+        radius = int(half_width * ratio)
+        if radius < 1:
+            continue
+        x1, x2 = cx - radius, cx + radius
+        valid_rows = mask[:, x1:x2].all(axis=1)
+        above = np.flatnonzero(~valid_rows[:cy])
+        below = np.flatnonzero(~valid_rows[cy:])
+        top = int(above[-1] + 1) if above.size else 0
+        bottom = int(cy + below[0]) if below.size else height
+        half_height = min(cy - top, bottom - cy)
+        if half_height < 1:
+            continue
+        rect = (x1, cy - half_height, radius * 2, half_height * 2)
+        if rect not in candidates:
+            candidates.append(rect)
+    return candidates
+
+
 class Line:
 
     def __init__(self, text: str = '', pos_x: int = 0, pos_y: int = 0, length: float = 0, spacing: int = 0) -> None:

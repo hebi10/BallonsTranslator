@@ -2835,6 +2835,11 @@ class ImageEffectCard(_EffectCard):
         layout.addLayout(prompt_layout)
         layout.addLayout(generation_actions)
         self._sync_generation_controls()
+        from ballontranslator.utils.local_edition import is_local_edition
+        if is_local_edition():
+            for widget in (generate_label, model_widget, prompt_label,
+                           self.prompt_editor, context_widget, self.generate_button):
+                widget.hide()
 
     def set_move_enabled(self, up: bool, down: bool) -> None:
         self.move_up_button.setEnabled(up)

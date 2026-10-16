@@ -1,4 +1,5 @@
-from dataclasses import replace
+from bisect import bisect_left
+from dataclasses import dataclass, replace
 import traceback
 from typing import Dict, List, Optional, Sequence, Tuple, Union, TYPE_CHECKING
 
@@ -58,7 +59,9 @@ from ..llm_chat import (
 from ..llm_vision import EncodedChatImage, encode_chat_image
 from .base import BaseTranslator, register_translator
 from .llm_translation_contract import (
+    DialogueBlock,
     InvalidNumTranslations,
+    PageDialogueContext,
     TranslationPromptSpec,
     assemble_translation_request,
     parse_translation_response,
@@ -96,6 +99,15 @@ from ballontranslator.utils.textblock import TextBlock
 
 MAX_PAGE_LONG_SIDE = 1536
 PAGE_IMAGE_JPEG_QUALITY = 85
+MAX_DIALOGUE_NEIGHBORS = 4
+MAX_DIALOGUE_NEIGHBOR_BYTES = 600
+
+
+@dataclass(frozen=True)
+class PageVisionContext(EncodedChatImage):
+    """Encoded page plus its original coordinate extent for frozen block metadata."""
+
+    page_size: Tuple[int, int]
 
 
 def _uses_explicit_cache(profile: LLMProfile) -> bool:
@@ -182,6 +194,11 @@ class LLMTranslator(LLMChatRequester, BaseTranslator):
         ] = {}
 
     @property
+    def low_vram_mode(self) -> bool:
+        from ballontranslator.utils.local_edition import is_local_edition
+        return is_local_edition() or super().low_vram_mode
+
+    @property
     def profile(self) -> LLMProfile:
         profile = runtime_profile(
             pcfg.module.llm_profiles,
@@ -249,12 +266,12 @@ class LLMTranslator(LLMChatRequester, BaseTranslator):
         return super().unload_model(empty_cache=empty_cache)
 
     @staticmethod
-    def _scaled_page_image(image: np.ndarray) -> np.ndarray:
+    def _scaled_page_image(image: np.ndarray, max_long_side: int = MAX_PAGE_LONG_SIDE) -> np.ndarray:
         height, width = image.shape[:2]
         long_side = max(height, width)
-        if long_side <= MAX_PAGE_LONG_SIDE:
+        if long_side <= max_long_side:
             return image
-        scale = MAX_PAGE_LONG_SIDE / long_side
+        scale = max_long_side / long_side
         size = (
             max(1, int(round(width * scale))),
             max(1, int(round(height * scale))),
@@ -266,7 +283,7 @@ class LLMTranslator(LLMChatRequester, BaseTranslator):
         project: ProjImgTrans,
         page_key: str,
         profile: LLMProfile,
-    ) -> EncodedChatImage:
+    ) -> PageVisionContext:
         """Read, normalize, and freeze one page image before retries."""
         if not profile.support_vision:
             raise RuntimeError(
@@ -275,7 +292,12 @@ class LLMTranslator(LLMChatRequester, BaseTranslator):
         image = project.read_img(page_key)
         if image is None or not isinstance(image, np.ndarray) or image.size == 0:
             raise RuntimeError(f'Unable to read page image: {page_key}')
-        request_image = self._scaled_page_image(image)
+        from ballontranslator.utils.local_edition import is_local_edition
+        max_long_side = MAX_PAGE_LONG_SIDE
+        if is_local_edition():
+            from ballontranslator.utils.local_ollama import MAX_IMAGE_DIMENSION
+            max_long_side = MAX_IMAGE_DIMENSION
+        request_image = self._scaled_page_image(image, max_long_side)
         source_height, source_width = image.shape[:2]
         request_height, request_width = request_image.shape[:2]
         safe_page_key = str(page_key).replace('\r', ' ').replace('\n', ' ')
@@ -288,12 +310,13 @@ class LLMTranslator(LLMChatRequester, BaseTranslator):
             f'resized={request_image.shape[:2] != image.shape[:2]}, '
             f'jpeg_quality={PAGE_IMAGE_JPEG_QUALITY}, detail={detail!r}'
         )
-        return encode_chat_image(
+        encoded = encode_chat_image(
             request_image,
             detail=detail,
             jpeg_quality=PAGE_IMAGE_JPEG_QUALITY,
             failure_message=f'Failed to encode page image: {page_key}',
         )
+        return PageVisionContext(encoded.data_url, encoded.detail, (source_width, source_height))
 
     def translate_textblk_lst(
         self,
@@ -321,6 +344,123 @@ class LLMTranslator(LLMChatRequester, BaseTranslator):
             full_page=full_page,
         )
 
+    def _translate_prepared_textblocks(
+        self,
+        text_list: List[str],
+        *,
+        textblk_lst: List[TextBlock],
+        non_empty_ids: List[int],
+        project: Optional[ProjImgTrans],
+        page_key: Optional[str],
+        commit_history_window: bool,
+    ) -> List[str]:
+        from ballontranslator.utils.local_edition import is_local_edition
+        if not is_local_edition():
+            return super()._translate_prepared_textblocks(
+                text_list, textblk_lst=textblk_lst, non_empty_ids=non_empty_ids,
+                project=project, page_key=page_key, commit_history_window=commit_history_window,
+            )
+        dialogue_context = self._snapshot_page_dialogue(
+            textblk_lst, non_empty_ids, project, page_key,
+        )
+        return self.translate(
+            text_list,
+            project=project,
+            page_key=page_key,
+            commit_history_window=commit_history_window,
+            dialogue_context=dialogue_context,
+        )
+
+    @staticmethod
+    def _snapshot_page_dialogue(
+        textblk_lst: List[TextBlock],
+        non_empty_ids: List[int],
+        project: Optional[ProjImgTrans],
+        page_key: Optional[str],
+    ) -> PageDialogueContext:
+        """Freeze exact block identities before requests can observe page edits.
+
+        >>> LLMTranslator._snapshot_page_dialogue([], [], None, None).inputs
+        ()
+        """
+        page = tuple(project.pages.get(page_key, ())) if project is not None else ()
+        page_indices = {id(block): index + 1 for index, block in enumerate(page)}
+
+        def snapshot(block: TextBlock, source: str = '', truncated: bool = False) -> DialogueBlock:
+            direction = block.src_is_vertical
+            return DialogueBlock(
+                page_index=page_indices.get(id(block)),
+                bbox=tuple(int(value) for value in block.xyxy),
+                source_writing_direction=(
+                    'unknown' if direction is None else 'vertical' if direction else 'horizontal'
+                ),
+                source=source,
+                source_truncated=truncated,
+            )
+
+        inputs = tuple(snapshot(textblk_lst[index]) for index in non_empty_ids)
+        selected = {id(block) for block in textblk_lst}
+        selected_indices = sorted(
+            page_indices[identity] for identity in selected if identity in page_indices
+        )
+        if not selected_indices:
+            return PageDialogueContext(inputs)
+
+        def distance(index: int) -> int:
+            position = bisect_left(selected_indices, index)
+            adjacent = selected_indices[max(0, position - 1):position + 1]
+            return min(abs(index - selected_index) for selected_index in adjacent)
+
+        candidates = sorted(
+            ((index + 1, block) for index, block in enumerate(page)
+             if id(block) not in selected and block.get_text().strip()),
+            key=lambda item: (distance(item[0]), item[0]),
+        )[:MAX_DIALOGUE_NEIGHBORS]
+        neighbors = []
+        remaining = MAX_DIALOGUE_NEIGHBOR_BYTES
+        # Cap each excerpt too, so one long neighboring block cannot hide both sides.
+        for _index, block in candidates:
+            source = block.get_text()
+            excerpt = source.encode('utf-8')[:min(300, remaining)].decode('utf-8', errors='ignore')
+            if not excerpt:
+                break
+            neighbors.append(snapshot(block, excerpt, excerpt != source))
+            remaining -= len(excerpt.encode('utf-8'))
+        return PageDialogueContext(
+            inputs,
+            tuple(sorted(neighbors, key=lambda block: block.page_index)),
+        )
+
+    @staticmethod
+    def _dialogue_needs_image(context: Optional[PageDialogueContext]) -> bool:
+        """Use visual context for tall vertical text or adjacent/overlapping boxes.
+
+        Geometry requests evidence; it never asserts shared speakers or balloons.
+
+        >>> LLMTranslator._dialogue_needs_image(None)
+        False
+        """
+        if context is None:
+            return False
+        inputs = tuple(block for block in context.inputs if len(block.bbox) == 4
+                       and block.bbox[2] > block.bbox[0] and block.bbox[3] > block.bbox[1])
+        neighbors = tuple(block for block in context.neighbors if len(block.bbox) == 4
+                          and block.bbox[2] > block.bbox[0] and block.bbox[3] > block.bbox[1])
+        for index, block in enumerate(inputs):
+            x1, y1, x2, y2 = block.bbox
+            width, height = x2 - x1, y2 - y1
+            if block.source_writing_direction == 'vertical' and height >= 1.8 * width:
+                return True
+            for other in inputs[index + 1:] + neighbors:
+                ox1, oy1, ox2, oy2 = other.bbox
+                gap_x = max(x1, ox1) - min(x2, ox2)
+                gap_y = max(y1, oy1) - min(y2, oy2)
+                if (gap_y <= 0 and gap_x <= .25 * min(width, ox2 - ox1)) or (
+                    gap_x <= 0 and gap_y <= .25 * min(height, oy2 - oy1)
+                ):
+                    return True
+        return False
+
     def translate(
         self,
         text: Optional[Union[str, List[str]]],
@@ -328,6 +468,7 @@ class LLMTranslator(LLMChatRequester, BaseTranslator):
         project: Optional[ProjImgTrans] = None,
         page_key: Optional[str] = None,
         commit_history_window: bool = False,
+        dialogue_context: Optional[PageDialogueContext] = None,
     ) -> Optional[Union[str, List[str]]]:
         """Translate one request with an immutable project-context snapshot.
 
@@ -350,6 +491,10 @@ class LLMTranslator(LLMChatRequester, BaseTranslator):
         )
         if text_is_empty(text) and not empty_page_summary:
             return text
+
+        from ballontranslator.utils.local_edition import is_local_edition
+        if is_local_edition() and not empty_page_summary:
+            vision_enabled = vision_enabled and self._dialogue_needs_image(dialogue_context)
 
         is_list = isinstance(text, List)
         queries = tuple(text) if is_list else (text,)
@@ -413,6 +558,8 @@ class LLMTranslator(LLMChatRequester, BaseTranslator):
                 str(page_key),
                 profile,
             )
+            if dialogue_context is not None:
+                dialogue_context = replace(dialogue_context, page_size=vision_request.page_size)
         request_context = self._snapshot_request_context(
             project,
             page_key,
@@ -438,6 +585,7 @@ class LLMTranslator(LLMChatRequester, BaseTranslator):
             commit_history_window=commit_history_window,
             vision_request=vision_request,
             summary_expected_record=existing_summary,
+            dialogue_context=dialogue_context,
         )
         if text_trans is None:
             text_trans = [''] * len(text) if is_list else ''
@@ -1246,6 +1394,7 @@ class LLMTranslator(LLMChatRequester, BaseTranslator):
         commit_history_window: bool = True,
         vision_request: Optional[EncodedChatImage] = None,
         summary_expected_record: Optional[Dict[str, object]] = None,
+        dialogue_context: Optional[PageDialogueContext] = None,
     ) -> List[str]:
         """Translate with ordinary retries and optional-context recovery.
 
@@ -1277,6 +1426,7 @@ class LLMTranslator(LLMChatRequester, BaseTranslator):
             prompt_spec=prompt_spec,
             request_context=request_context,
             codex_replay=profile.backend == 'codex',
+            dialogue_context=dialogue_context,
             image_part=(
                 vision_request.image_part()
                 if vision_request is not None
@@ -1286,6 +1436,12 @@ class LLMTranslator(LLMChatRequester, BaseTranslator):
         retry_attempt = 0
         provider_attempt = 0
         active_context = request_context
+        active_dialogue = dialogue_context
+        active_vision = vision_request
+        from ballontranslator.utils.local_edition import is_local_edition
+        optional_local_vision = bool(
+            is_local_edition() and active_vision is not None and active_dialogue is not None
+        )
         has_optional_summaries = bool(
             active_context is not None
             and any(
@@ -1299,6 +1455,8 @@ class LLMTranslator(LLMChatRequester, BaseTranslator):
             if active_context is not None
             else 0
         )
+        recovery_limit += int(bool(active_dialogue and active_dialogue.neighbors))
+        recovery_limit += int(optional_local_vision)
         recovery_attempts = 0
         codex_turn = None
         if profile.backend == 'codex':
@@ -1347,30 +1505,45 @@ class LLMTranslator(LLMChatRequester, BaseTranslator):
                 break
             except ContextLengthError as error:
                 # Provider tokenization can exceed our estimate; remove optional
-                # summaries, then whole history pages, without consuming retries.
+                # summaries, history, neighbors, then local visual context. Never
+                # truncate the selected source or alter its ID/geometry mapping.
                 if recovery_attempts >= recovery_limit:
                     raise
                 recovered_context = recover_context_length(active_context)
                 if recovered_context is None:
-                    raise
+                    if active_dialogue is not None and active_dialogue.neighbors:
+                        active_dialogue = replace(active_dialogue, neighbors=())
+                        recovery_reason = 'neighbors-removed'
+                    elif optional_local_vision and active_vision is not None:
+                        active_vision = None
+                        recovery_reason = 'local-image-removed'
+                        self.logger.warning(
+                            '%s: 입력 한도로 이미지 문맥을 제외하고 원문과 위치 정보를 유지해 번역합니다.',
+                            str(usage_page_key or '-').replace('\r', ' ').replace('\n', ' '),
+                        )
+                    else:
+                        raise
+                else:
+                    active_context = recovered_context
+                    recovery_reason = str(recovered_context.diagnostic)
                 safe_error = str(error).replace('\r', ' ').replace('\n', ' ')
                 self.logger.debug(
                     'LLM context-length recovery: '
                     f'provider_attempt={provider_attempt}, '
                     f'trigger={safe_error!r}, '
-                    f'{recovered_context.diagnostic}; retrying with reduced '
+                    f'{recovery_reason}; retrying with reduced '
                     'optional context without consuming the retry budget.'
                 )
                 recovery_attempts += 1
-                active_context = recovered_context
                 messages, prompt = assemble_translation_request(
                     queries,
                     prompt_spec=prompt_spec,
                     request_context=active_context,
                     codex_replay=profile.backend == 'codex',
+                    dialogue_context=active_dialogue,
                     image_part=(
-                        vision_request.image_part()
-                        if vision_request is not None
+                        active_vision.image_part()
+                        if active_vision is not None
                         else None
                     ),
                 )

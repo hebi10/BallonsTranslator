@@ -1,5 +1,9 @@
 __pycache__
 local_*
+!ballontranslator/utils/local_edition.py
+!ballontranslator/utils/local_ollama.py
+!ballontranslator/ui/local_workspace.py
+!scripts/local_windows_helpers.ps1
 inpainted
 mask
 result

@@ -350,6 +350,20 @@ class LLMChatRequester:
         # adopt the replacement run's token for this request's existing inputs.
         stop_event = self.stop_event
         self._check_request_current(stop_event)
+        from ballontranslator.utils.local_edition import is_local_edition, LOCAL_PROFILE_ID
+        if is_local_edition():
+            from ballontranslator.utils.local_ollama import OllamaClient, LocalOperationCancelled, LocalContextTooLong
+            if profile.id != LOCAL_PROFILE_ID or profile.base_url != 'http://127.0.0.1:11435/v1':
+                raise RuntimeError('로컬 번역 설정이 변경되었습니다. 프로그램을 다시 실행해 주세요.')
+            try:
+                result = OllamaClient().chat(api_args, stop_event)
+            except LocalOperationCancelled as error:
+                raise LLMRequestStopped() from error
+            except LocalContextTooLong as error:
+                from .context.errors import ContextLengthError
+                raise ContextLengthError(str(error)) from error
+            self._check_request_current(stop_event)
+            return LLMChatResult(**result)
         if profile.backend == 'codex':
             if self._openai_session is not None:
                 self._openai_session.close()

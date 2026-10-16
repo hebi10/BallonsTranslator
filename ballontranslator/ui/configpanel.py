@@ -14,6 +14,7 @@ from qtpy.QtGui import QStandardItem, QStandardItemModel, QMouseEvent, QFont, QI
 
 from .custom_widget import ConfigComboBox, NoBorderPushBtn, ScrollBar, Widget
 from ballontranslator.utils import shared
+from ballontranslator.utils.local_edition import is_local_edition
 from ballontranslator.utils.config import OCRTextPostprocess, pcfg
 from ballontranslator.utils.version import APP_VERSION
 from ballontranslator.utils.network_mirrors import (
@@ -736,8 +737,9 @@ class ConfigPanel(OutsideClickFramelessMixin, FramelessWindow):
         label_spellcheck = self.tr('Spell Checker')
 
         pipelineConfigPanel = self.addConfigBlock(label_pipeline, moduleTableItem, 'pipeline')
-        llmProfileConfigPanel = self.addConfigBlock(label_llm_profile, moduleTableItem, 'llm_profile')
-        codexConfigPanel = self.addConfigBlock(self.tr('Codex'), moduleTableItem, 'codex')
+        if not is_local_edition():
+            llmProfileConfigPanel = self.addConfigBlock(label_llm_profile, moduleTableItem, 'llm_profile')
+            codexConfigPanel = self.addConfigBlock(self.tr('Codex'), moduleTableItem, 'codex')
         applicationConfigPanel = self.addConfigBlock(label_application, generalTableItem, 'application')
         typesettingConfigPanel = self.addConfigBlock(label_typesetting, generalTableItem, 'typesetting')
         spellcheckConfigPanel = self.addConfigBlock(label_spellcheck, generalTableItem, 'spellcheck')
@@ -832,10 +834,13 @@ class ConfigPanel(OutsideClickFramelessMixin, FramelessWindow):
         self.replaceMTkeywordBtn.clicked.connect(self.show_MT_keyword_window)
         pipeline_options_layout.addWidget(self.replaceMTkeywordBtn)
         pipelineConfigPanel.vlayout.addWidget(pipeline_options)
-        self.llm_profiles_panel = LLMProfilesWidget(scrollWidget=self)
-        llmProfileConfigPanel.addBlockWidget(self.llm_profiles_panel)
-        self.codex_panel = CodexSettingsPanel(scrollWidget=self)
-        codexConfigPanel.addBlockWidget(self.codex_panel)
+        self.llm_profiles_panel = None
+        self.codex_panel = None
+        if not is_local_edition():
+            self.llm_profiles_panel = LLMProfilesWidget(scrollWidget=self)
+            llmProfileConfigPanel.addBlockWidget(self.llm_profiles_panel)
+            self.codex_panel = CodexSettingsPanel(scrollWidget=self)
+            codexConfigPanel.addBlockWidget(self.codex_panel)
 
         update_status_widget = QWidget()
         update_status_widget.setObjectName('ConfigInlineRow')
@@ -872,8 +877,11 @@ class ConfigPanel(OutsideClickFramelessMixin, FramelessWindow):
         self.open_on_startup_checker, _ = applicationConfigPanel.addCheckBox(self.tr('Reopen last project on startup'))
         self.open_on_startup_checker.stateChanged.connect(self.on_open_onstartup_changed)
 
-        self.check_update_on_startup_checker, _ = applicationConfigPanel.addCheckBox(self.tr('Check update on startup'))
+        self.check_update_on_startup_checker, startup_update_row = applicationConfigPanel.addCheckBox(self.tr('Check update on startup'))
         self.check_update_on_startup_checker.stateChanged.connect(self.on_check_update_onstartup_changed)
+        if is_local_edition():
+            update_status_widget.hide()
+            startup_update_row.hide()
 
         self.spellcheck_checker, _ = spellcheckConfigPanel.addCheckBox(self.tr('Enable'))
         self.spellcheck_checker.stateChanged.connect(self.on_spellcheck_changed)
@@ -1442,6 +1450,8 @@ class ConfigPanel(OutsideClickFramelessMixin, FramelessWindow):
 
     def showSection(self, section_key: str):
         section_key = SECTION_ALIASES.get(section_key, section_key)
+        if is_local_edition() and section_key in {'codex', 'llm_profile'}:
+            section_key = 'pipeline'
         self.configContent.showSection(section_key)
         self.configTable.setCurrentSection(section_key)
 
@@ -1734,12 +1744,17 @@ class ConfigPanel(OutsideClickFramelessMixin, FramelessWindow):
         self.save_config.emit()
 
     def syncLLMProfile(self, profile_id: str) -> None:
+        if is_local_edition():
+            return
         if profile_id == 'codex':
             self.codex_panel.syncFromProfile()
         else:
             self.llm_profiles_panel.syncProfile(profile_id)
 
     def focusOnLLMProfile(self, profile_id: str, expand_details: bool = True, target: str = 'api_key') -> None:
+        if is_local_edition():
+            self.showConfigDialog('pipeline')
+            return
         if profile_id == 'codex':
             self.showConfigDialog('codex')
             self.codex_panel.focusControl(target)
@@ -1748,7 +1763,7 @@ class ConfigPanel(OutsideClickFramelessMixin, FramelessWindow):
         self.llm_profiles_panel.focusProfileControl(profile_id, target=target, expand_details=expand_details)
 
     def hideEvent(self, e) -> None:
-        if hasattr(self, 'llm_profiles_panel'):
+        if self.llm_profiles_panel is not None:
             self.llm_profiles_panel.collapseProfiles()
         self.save_config.emit()
         return super().hideEvent(e)

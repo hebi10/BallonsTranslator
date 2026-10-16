@@ -134,6 +134,13 @@ class TextBlkEncoder(NumpyEncoder):
 
 class ProjImgTrans:
 
+    _pipeline_stage_codes = {
+        'detect': RunStatus.FIN_DET,
+        'ocr': RunStatus.FIN_OCR,
+        'translate': RunStatus.FIN_TRANSLATE,
+        'inpaint': RunStatus.FIN_INPAINT,
+    }
+
     def __init__(self, directory: str = None):
         self._load_identity = object()
         self._raster_asset_cache: Dict[
@@ -667,6 +674,13 @@ class ProjImgTrans:
             if p not in self._image_info:
                 self._image_info[p] = {}
             img_info = self._image_info[p]
+            failed_stage = img_info.get('pipeline_failed_stage')
+            if 'pipeline_failed_stage' in img_info and (
+                not isinstance(failed_stage, str)
+                or failed_stage not in self._pipeline_stage_codes
+            ):
+                LOGGER.warning('Invalid pipeline_failed_stage for page %s; ignoring it.', p)
+                img_info.pop('pipeline_failed_stage', None)
             summary_record = img_info.get('llm_visual_summary')
             if (
                 summary_record is not None
@@ -724,15 +738,39 @@ class ProjImgTrans:
         if code & RunStatus.FIN_TRANSLATE:
             self._image_info[pagename].pop('translation_target', None)
 
-    def update_page_progress(self, pagename, code):
-        self._image_info[pagename]['finish_code'] |= code
+    def update_page_progress(self, pagename: str, code: int) -> None:
+        info = self._image_info[pagename]
+        info['finish_code'] |= code
+        failed_code = self._pipeline_stage_codes.get(info.get('pipeline_failed_stage'), 0)
+        if failed_code & code:
+            info.pop('pipeline_failed_stage', None)
+
+    def page_stage_finished(self, page_key: str, code: int) -> bool:
+        """Return whether the saved page completed every requested stage bit."""
+        return (self._image_info[page_key]['finish_code'] & code) == code
+
+    def mark_stage_failed(self, page_key: str, stage: str) -> None:
+        """Retain completed work while recording the stage to retry.
+
+        >>> 'ocr' in ProjImgTrans._pipeline_stage_codes
+        True
+        """
+        self.clear_page_progress(page_key, self._pipeline_stage_codes[stage])
+        self._image_info[page_key]['pipeline_failed_stage'] = stage
+
+    def failed_pages(self) -> List[str]:
+        """Return failed pages in project order, excluding untouched pages."""
+        return [
+            page for page in self.pages
+            if self._image_info[page].get('pipeline_failed_stage')
+        ]
 
     def invalidate_translation(self, page_key):
         self.clear_page_progress(page_key, RunStatus.FIN_TRANSLATE)
 
-    def begin_detection(self, page_key):
-        """Invalidate translation before detection can replace page blocks."""
-        self.invalidate_translation(page_key)
+    def begin_detection(self, page_key: str) -> None:
+        """Invalidate dependent work before detection can replace page blocks."""
+        self.clear_page_progress(page_key, RunStatus.FIN_ALL)
 
     def begin_full_page_translation(self, page_key):
         """Invalidate old completion until a full translation succeeds."""

@@ -118,6 +118,7 @@ class ModuleConfig(Config):
     llm_glossary_path: str = ''
     llm_glossary_mode: str = LLMGlossaryMode.Matching
     llm_translate_vision: bool = False
+    local_visual_context: bool = True
     llm_translate_summary_memory: bool = False
     llm_translate_overwrite_summary: bool = False
 
@@ -205,6 +206,7 @@ class ModuleConfig(Config):
             ('ocr_llm_mask_non_text', True),
             ('ocr_llm_sort_reading_order', True),
             ('llm_translate_vision', False),
+            ('local_visual_context', True),
             ('llm_translate_summary_memory', False),
             ('llm_translate_overwrite_summary', False),
         ):

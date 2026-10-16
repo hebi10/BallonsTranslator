@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -139,10 +140,10 @@ class CodexProfileConfigTest(unittest.TestCase):
     def test_missing_codex_settings_use_canonical_defaults(self) -> None:
         for payload in ({}, {'codex_models': {}}, {'llm_profiles': []},
                         {'llm_profiles': [profile_to_dict(default_profile('Ollama'))], 'codex_models': {}}):
-            with self.subTest(payload=payload), tempfile.NamedTemporaryFile('w+', encoding='utf8') as temp:
-                json.dump({'module': payload}, temp)
-                temp.flush()
-                loaded = ProgramConfig.load(temp.name).module
+            with self.subTest(payload=payload), tempfile.TemporaryDirectory() as directory:
+                config_path = Path(directory) / 'config.json'
+                config_path.write_text(json.dumps({'module': payload}), encoding='utf8')
+                loaded = ProgramConfig.load(str(config_path)).module
                 codex_profiles = [profile for profile in loaded.llm_profiles if profile.backend == 'codex']
                 self.assertEqual(len(codex_profiles), 1)
                 self.assertEqual(codex_profiles[0].id, 'codex')
@@ -166,10 +167,10 @@ class CodexProfileConfigTest(unittest.TestCase):
         }
         module = ModuleConfig(llm_profiles=[codex], codex_models=catalog, translator_llm_id='codex')
         serialized = json_dump_program_config(ProgramConfig(module=module))
-        with tempfile.NamedTemporaryFile('w+', encoding='utf8') as temp:
-            temp.write(serialized)
-            temp.flush()
-            restarted = ProgramConfig.load(temp.name).module
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / 'config.json'
+            config_path.write_text(serialized, encoding='utf8')
+            restarted = ProgramConfig.load(str(config_path)).module
         saved = profile_by_id(restarted.llm_profiles, 'codex')
         self.assertEqual({key: getattr(saved, key) for key in settings}, settings)
         self.assertTrue(saved.support_text)
@@ -437,10 +438,10 @@ class LLMProfileConfigTest(unittest.TestCase):
         raw = json.loads(json_dump_program_config(cfg))
         raw['module']['llm_profiles'][0]['model_options'] = ['legacy-model']
 
-        with tempfile.NamedTemporaryFile('w+', encoding='utf8') as temp:
-            json.dump(raw, temp)
-            temp.flush()
-            loaded = ProgramConfig.load(temp.name)
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / 'config.json'
+            config_path.write_text(json.dumps(raw), encoding='utf8')
+            loaded = ProgramConfig.load(str(config_path))
 
         selected = profile_by_id(loaded.module.llm_profiles, 'openai')
         self.assertIn('legacy-model', selected.model_options)
@@ -689,10 +690,10 @@ class SecretStoreTest(unittest.TestCase):
         cfg = ProgramConfig(module=ModuleConfig(llm_profiles=[profile], translator_llm_id='openai'))
         saved = json_dump_program_config(cfg)
 
-        with tempfile.NamedTemporaryFile('w+', encoding='utf8') as temp:
-            temp.write(saved)
-            temp.flush()
-            loaded = ProgramConfig.load(temp.name)
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / 'config.json'
+            config_path.write_text(saved, encoding='utf8')
+            loaded = ProgramConfig.load(str(config_path))
 
         selected = profile_by_id(loaded.module.llm_profiles, loaded.module.translator_llm_id)
         self.assertIsNotNone(selected)
@@ -715,10 +716,10 @@ class SecretStoreTest(unittest.TestCase):
         ))
         saved = json_dump_program_config(cfg)
 
-        with tempfile.NamedTemporaryFile('w+', encoding='utf8') as temp:
-            temp.write(saved)
-            temp.flush()
-            loaded = ProgramConfig.load(temp.name)
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / 'config.json'
+            config_path.write_text(saved, encoding='utf8')
+            loaded = ProgramConfig.load(str(config_path))
 
         selected = profile_by_id(loaded.module.llm_profiles, loaded.module.ocr_llm_id)
         self.assertEqual(loaded.module.ocr_llm_id, 'openai')
@@ -756,10 +757,10 @@ class SecretStoreTest(unittest.TestCase):
         ))
         saved = json_dump_program_config(cfg)
 
-        with tempfile.NamedTemporaryFile('w+', encoding='utf8') as temp:
-            temp.write(saved)
-            temp.flush()
-            loaded = ProgramConfig.load(temp.name)
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / 'config.json'
+            config_path.write_text(saved, encoding='utf8')
+            loaded = ProgramConfig.load(str(config_path))
 
         selected = profile_by_id(loaded.module.llm_profiles, loaded.module.inpaint_llm_id)
         self.assertEqual(loaded.module.inpaint_llm_id, 'openrouter')

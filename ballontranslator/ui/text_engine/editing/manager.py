@@ -1,12 +1,15 @@
 
 from enum import Enum
 from typing import List, Optional, Sequence, Union, Tuple
+from uuid import uuid4
 import numpy as np
 import copy
+import cv2
+import math
 
 from qtpy.QtWidgets import QApplication, QWidget
 from qtpy.QtCore import QObject, QRectF, Qt, Signal, QPointF
-from qtpy.QtGui import QKeyEvent, QTextCursor, QFontMetricsF, QFont, QTextCharFormat, QClipboard
+from qtpy.QtGui import QKeyEvent, QTextCursor, QFontMetricsF, QFont, QTextCharFormat, QClipboard, QImage, QPainter
 try:
     from qtpy.QtWidgets import QUndoCommand
 except:
@@ -14,6 +17,7 @@ except:
 
 from ..item import TextBlkItem, TextBlock
 from ...canvas import Canvas
+from ...misc import pixmap2ndarray
 from .widgets import TransTextEdit, SourceTextEdit, TransPairWidget, TextEditListScrollArea, QVBoxLayout, Widget
 from ballontranslator.utils.fontformat import FontFormat
 from .commands import (
@@ -36,8 +40,54 @@ from ..formatting.panel import FontFormatPanel
 from ballontranslator.utils.config import pcfg
 from ballontranslator.utils import shared
 from ballontranslator.utils.imgproc_utils import extract_ballon_region, get_block_mask
-from ballontranslator.utils.text_processing import seg_text, is_cjk
-from ballontranslator.utils.text_layout import layout_text
+from ballontranslator.utils.text_processing import seg_text, is_cjk, PUNCTUATION_L, PUNCTUATION_R
+from ballontranslator.utils.text_layout import layout_text, centered_mask_rectangles
+from ballontranslator.utils.logger import logger as LOGGER
+from ..rendering.indexing import _grapheme_ranges, _utf16_slice
+
+
+def _wrap_korean_dialogue(words: List[str], metrics: QFontMetricsF, width: float, max_lines: int) -> Optional[str]:
+    """Wrap at Korean word boundaries, splitting only oversized grapheme runs.
+
+    Original spaces and hard breaks remain content. A bounded line count lets
+    the caller reject an overlong candidate without repeatedly laying it out.
+    """
+    lines, line = [], ''
+    for word in words:
+        if word in ('\n', '\r', '\r\n'):
+            lines.append(line)
+            line = ''
+        elif metrics.horizontalAdvance(line + word) <= width:
+            line += word
+        else:
+            if line:
+                lines.append(line)
+                line = ''
+            if metrics.horizontalAdvance(word) <= width:
+                line = word
+            else:
+                for start, end in _grapheme_ranges(word):
+                    grapheme = _utf16_slice(word, start, end - start)
+                    if line and metrics.horizontalAdvance(line + grapheme) > width:
+                        if grapheme[0] in PUNCTUATION_R:
+                            line += grapheme
+                            continue
+                        carry = ''
+                        while line and line[-1] in PUNCTUATION_L:
+                            carry = line[-1] + carry
+                            line = line[:-1]
+                        if line:
+                            lines.append(line)
+                        line = carry
+                    line += grapheme
+                    if len(lines) >= max_lines:
+                        return None
+        if len(lines) >= max_lines:
+            return None
+    lines.append(line)
+    if len(lines) > max_lines or any(metrics.horizontalAdvance(row) > width for row in lines):
+        return None
+    return '\n'.join(lines)
 
 
 def build_path_reorder_map(
@@ -254,6 +304,146 @@ class DeleteBlkItemsCommand(QUndoCommand):
             self.sw.updateCounterText()
 
 
+class RegionReworkCommand(QUndoCommand):
+    """Replace selected blocks and page pixels as one reversible operation.
+
+    Detached items keep their documents and paired editors so earlier text
+    commands remain valid. New blocks arrive with committed layout already set.
+
+    >>> callable(RegionReworkCommand.redo)
+    True
+    """
+
+    def __init__(
+        self,
+        ctrl: 'SceneTextManager',
+        old_items: List[TextBlkItem],
+        new_blocks: List[TextBlock],
+        rect: Tuple[int, int, int, int],
+        inpainted: np.ndarray,
+        mask: np.ndarray,
+    ) -> None:
+        super().__init__()
+        if not old_items and not new_blocks:
+            raise ValueError('Region rework requires text blocks')
+        if len(rect) != 4 or any(not isinstance(value, (int, np.integer)) for value in rect):
+            raise ValueError('Region rectangle must contain four integer coordinates')
+        x1, y1, x2, y2 = rect
+        project = ctrl.imgtrans_proj
+        height, width = project.inpainted_array.shape[:2]
+        if not (0 <= x1 < x2 <= width and 0 <= y1 < y2 <= height):
+            raise ValueError('Region rectangle is outside the page')
+        if (inpainted.shape != project.inpainted_array[y1:y2, x1:x2].shape
+                or mask.shape != project.mask_array[y1:y2, x1:x2].shape
+                or inpainted.dtype != project.inpainted_array.dtype
+                or mask.dtype != project.mask_array.dtype):
+            raise ValueError('Region image and mask must match the page crop')
+        if (len(set(old_items)) != len(old_items)
+                or any(item not in ctrl.textblk_item_list for item in old_items)):
+            raise ValueError('Region items must belong to the current scene')
+
+        ctrl.formatpanel.resolve_text_transform_edits_for_history_change()
+        self.ctrl = ctrl
+        self.canvas = ctrl.canvas
+        self.rect = tuple(int(value) for value in rect)
+        self.old_items = sorted(old_items, key=lambda item: item.idx)
+        self.old_indexes = [item.idx for item in self.old_items]
+        self.old_pairs = [ctrl.pairwidget_list[index] for index in self.old_indexes]
+        self.insert_index = self.old_indexes[0] if self.old_indexes else len(ctrl.textblk_item_list)
+        self.new_blocks = copy.deepcopy(new_blocks)
+        self.new_items: Optional[List[TextBlkItem]] = None
+        self.new_pairs: List[TransPairWidget] = []
+        self.old_image = project.inpainted_array[y1:y2, x1:x2].copy()
+        self.old_mask = project.mask_array[y1:y2, x1:x2].copy()
+        self.new_image = inpainted.copy()
+        self.new_mask = mask.copy()
+        self.pixels_changed = (
+            not np.array_equal(self.old_image, self.new_image)
+            or not np.array_equal(self.old_mask, self.new_mask)
+        )
+        drawing_crop = pixmap2ndarray(self.canvas.drawingLayer.get_drawed_pixmap().copy(
+            x1, y1, x2 - x1, y2 - y1,
+        ))
+        self.drawing_eraser: Optional[QImage] = None
+        if drawing_crop is not None and np.any(drawing_crop[:, :, 3]):
+            self.drawing_eraser = QImage(
+                x2 - x1, y2 - y1, QImage.Format.Format_ARGB32_Premultiplied,
+            )
+            self.drawing_eraser.fill(Qt.GlobalColor.black)
+            self.drawing_key = uuid4().hex
+
+    def _prepare_replay(self) -> None:
+        editing = self.canvas.editing_textblkitem
+        if editing is not None and editing.isEditing():
+            editing.endEdit(keep_focus=False)
+        QApplication.inputMethod().reset()
+        focus = QApplication.focusWidget()
+        if isinstance(focus, SourceTextEdit):
+            focus.clearFocus()
+        self.ctrl.changeHoveringWidget(None)
+        self.ctrl.textEditList.clearAllSelected(emit_signal=False)
+        self.canvas.set_primary_selected_text_item(None)
+        self.ctrl.set_blkitems_selection(False)
+        self.canvas.search_widget.clean_highlighted()
+        self.canvas.search_widget.clearSearchResult()
+        self.canvas.search_widget.counter_sum = 0
+
+    def _recover(
+        self,
+        items: List[TextBlkItem],
+        pairs: List[TransPairWidget],
+        indexes: Sequence[int],
+    ) -> None:
+        for item, pair, index in zip(items, pairs, indexes):
+            item.idx = index
+            pair.updateIndex(index)
+        self.ctrl.recoverTextblkItemList(items, pairs)
+
+    def _publish(self, image: np.ndarray, mask: np.ndarray, clear_drawing: bool) -> None:
+        project = self.ctrl.imgtrans_proj
+        # Publish membership once; unaffected live documents stay untouched.
+        project.current_block_list()[:] = [item.blk for item in self.ctrl.textblk_item_list]
+        if self.pixels_changed:
+            x1, y1, x2, y2 = self.rect
+            project.inpainted_array[y1:y2, x1:x2] = image
+            project.mask_array[y1:y2, x1:x2] = mask
+            self.canvas.updateLayers()
+        if self.drawing_eraser is not None:
+            if clear_drawing:
+                self.canvas.drawingLayer.addQImage(
+                    self.rect[0], self.rect[1], self.drawing_eraser,
+                    QPainter.CompositionMode.CompositionMode_DestinationOut, self.drawing_key,
+                )
+            else:
+                self.canvas.drawingLayer.removeQImage(self.drawing_key)
+        if self.pixels_changed or self.drawing_eraser is not None:
+            self.canvas.draw_undo_stack.resetClean()
+        self.canvas.search_widget.page_search()
+
+    def redo(self) -> None:
+        self._prepare_replay()
+        self.ctrl.deleteTextblkItemList(self.old_items, self.old_pairs)
+        if self.new_items is None:
+            self.new_items = []
+            for block in self.new_blocks:
+                # Passing an item bypasses the manager's pipeline auto-layout.
+                item = TextBlkItem(block, len(self.ctrl.textblk_item_list),
+                                   show_rect=self.canvas.textblock_mode)
+                self.ctrl.addTextBlock(item)
+                self.new_items.append(item)
+                self.new_pairs.append(self.ctrl.pairwidget_list[item.idx])
+            self.ctrl.deleteTextblkItemList(self.new_items, self.new_pairs)
+        self._recover(self.new_items, self.new_pairs,
+                      range(self.insert_index, self.insert_index + len(self.new_items)))
+        self._publish(self.new_image, self.new_mask, clear_drawing=True)
+
+    def undo(self) -> None:
+        self._prepare_replay()
+        self.ctrl.deleteTextblkItemList(self.new_items, self.new_pairs)
+        self._recover(self.old_items, self.old_pairs, self.old_indexes)
+        self._publish(self.old_image, self.old_mask, clear_drawing=False)
+
+
 class PasteBlkItemsCommand(QUndoCommand):
     def __init__(self, blk_list: List[TextBlkItem], pwidget_list: List[TransPairWidget], ctrl, parent=None):
         super().__init__(parent)
@@ -410,6 +600,7 @@ class SceneTextManager(QObject):
         self.pairwidget_list: List[TransPairWidget] = self.textEditList.pairwidget_list
 
         self.auto_textlayout_flag = False
+        self.auto_layout_failed: List[int] = []
         self.hovering_transwidget : TransTextEdit = None
 
         self._text_move_snapshot = {}
@@ -513,6 +704,7 @@ class SceneTextManager(QObject):
 
     def populateSceneTextitems(self):
         """Create scene items for the project's already-selected current page."""
+        self.auto_layout_failed = []
         self.hovering_transwidget = None
         for textblock in self.imgtrans_proj.current_block_list():
             if textblock.font_family is None or textblock.font_family.strip() == '':
@@ -548,7 +740,9 @@ class SceneTextManager(QObject):
             if translation:
                 blk.translation = translation
                 rst = self.layout_textblk(blk_item, text=translation)
-                if rst is None:
+                if rst is False:
+                    self.auto_layout_failed.append(blk_item.idx)
+                if rst is None or rst is False:
                     blk_item.setPlainText(translation)
         self.addTextBlkItem(blk_item)
 
@@ -874,6 +1068,128 @@ class SceneTextManager(QObject):
             self._update_selection_panels([item])
         session.activate_last_projective(item)
 
+    def _korean_layout_mask(self, item: TextBlkItem) -> Optional[Tuple[np.ndarray, List[int], Tuple[int, int]]]:
+        """Find a padded balloon mask from source geometry, never edited bounds."""
+        img = self.imgtrans_proj.img_array
+        if img is None or item.blk.angle or not item._text_transform_is_neutral():
+            return None
+        height, width = img.shape[:2]
+        points = np.asarray(item.blk.lines)
+        if points.size and points.shape[-1] == 2:
+            points = points.reshape(-1, 2)
+            x1, y1 = points.min(axis=0)
+            x2, y2 = points.max(axis=0)
+        else:
+            x1, y1, x2, y2 = item.blk.xyxy
+        x1, y1 = max(0, int(x1)), max(0, int(y1))
+        x2, y2 = min(width, int(x2)), min(height, int(y2))
+        if x2 - x1 < 2 or y2 - y1 < 2:
+            return None
+        cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+        enclosing, previous_bounds = [], None
+        for scale in (1.25, 2.5, 4.0):
+            radius = max(16, int(math.ceil(max(x2 - x1, y2 - y1) * scale)))
+            bounds = [max(0, cx - radius), max(0, cy - radius), min(width, cx + radius), min(height, cy + radius)]
+            if bounds == previous_bounds:
+                continue
+            previous_bounds = bounds
+            bx1, by1, bx2, by2 = bounds
+            source = img[by1:by2, bx1:bx2]
+            gray = cv2.cvtColor(source, cv2.COLOR_RGB2GRAY) if source.ndim == 3 else source
+            edges = cv2.Canny(cv2.GaussianBlur(gray, (3, 3), 0), 70, 140, L2gradient=True)
+            contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+            corners = ((x1 - bx1, y1 - by1), (x2 - bx1, y1 - by1), (x1 - bx1, y2 - by1), (x2 - bx1, y2 - by1))
+            for contour in contours:
+                area = cv2.contourArea(contour)
+                if area <= (x2 - x1) * (y2 - y1):
+                    continue
+                x, y, w, h = cv2.boundingRect(contour)
+                if x <= 0 or y <= 0 or x + w >= source.shape[1] or y + h >= source.shape[0]:
+                    continue
+                if all(cv2.pointPolygonTest(contour, point, False) >= 0 for point in corners):
+                    enclosing.append((area, contour))
+            if enclosing:
+                break
+        # A crop edge or OCR glyph is not a balloon boundary. Open outlines and
+        # background captions remain editable and require manual review.
+        if not enclosing:
+            return None
+        contour = min(enclosing, key=lambda value: value[0])[1]
+        mask = np.zeros(gray.shape, np.uint8)
+        cv2.drawContours(mask, [contour], -1, 255, cv2.FILLED)
+        padding = max(3, int(round(max(item.blk._detected_font_size, 12) * .15)))
+        safe = cv2.erode((mask > 220).astype(np.uint8), np.ones((padding * 2 + 1,) * 2, np.uint8), borderType=cv2.BORDER_CONSTANT, borderValue=0).astype(bool)
+        center = ((x1 + x2) // 2 - bx1, (y1 + y2) // 2 - by1)
+        return safe, bounds, center
+
+    @staticmethod
+    def _korean_bounds_fit(item: TextBlkItem, safe: np.ndarray, bounds: List[int]) -> bool:
+        # Paint bounds include effect padding and glyph/annotation ink, unlike
+        # visual_bounds_in_scene(), which describes the logical transform box.
+        minimum_height, minimum_width = item.layout.minSize()
+        logical = item.logical_unpadded_rect()
+        if minimum_width > logical.width() + .5 or minimum_height > logical.height() + .5:
+            return False
+        # Text items live in the image-coordinate text layer. Its ancestor's
+        # scene scale is the editor zoom and must not affect this pixel check.
+        rect = item.mapRectToParent(item.boundingRect())
+        values = (rect.left(), rect.top(), rect.right(), rect.bottom())
+        if not all(math.isfinite(value) for value in values):
+            return False
+        x1, y1 = math.floor(rect.left()) - bounds[0], math.floor(rect.top()) - bounds[1]
+        x2, y2 = math.ceil(rect.right()) - bounds[0], math.ceil(rect.bottom()) - bounds[1]
+        if x1 < 0 or y1 < 0 or x2 > safe.shape[1] or y2 > safe.shape[0] or x2 <= x1 or y2 <= y1:
+            return False
+        return bool(safe[y1:y2, x1:x2].all())
+
+    def korean_layout_fits(self, item: TextBlkItem) -> bool:
+        """Read-only validation before automatically saving Korean dialogue."""
+        if pcfg.module.translate_target != '한국어' or item.blk.vertical or not item.toPlainText().strip():
+            return True
+        region = self._korean_layout_mask(item)
+        return region is not None and self._korean_bounds_fit(item, region[0], region[1])
+
+    def _layout_korean_textblk(self, item: TextBlkItem, text: str) -> bool:
+        original_size = item.font().pointSizeF()
+        original_rect = item.absBoundingRect(qrect=True)
+        region = self._korean_layout_mask(item)
+        if region is not None:
+            safe, bounds, center = region
+            rectangles = centered_mask_rectangles(safe, center)
+            words, _ = seg_text(text, '한국어')
+            floor_size = min(original_size, max(8.0, original_size * .5))
+            sizes = np.linspace(original_size, floor_size, 12) if original_size > floor_size else [original_size]
+            if pcfg.let_fntsize_flag != 0:
+                sizes = [original_size]
+            for size in sizes:
+                font = QFont(item.font())
+                font.setPointSizeF(float(size))
+                metrics = QFontMetricsF(font)
+                for _x, _y, width, height in rectangles:
+                    max_lines = max(1, int(height / max(metrics.height(), 1)) + 1)
+                    wrapped = _wrap_korean_dialogue(words, metrics, width - 2, max_lines)
+                    if wrapped is None:
+                        continue
+                    item.setFontSize(float(size))
+                    item.set_size(width, height, set_layout_maxsize=True)
+                    item.setPlainText(wrapped)
+                    item.squeezeBoundingRect()
+                    # Keep the detected dialogue center, including when a
+                    # previous candidate resized or grew the live document.
+                    current = item.absBoundingRect(qrect=True)
+                    target = QPointF(bounds[0] + center[0], bounds[1] + center[1])
+                    item.setPos(item.pos() + target - current.center())
+                    if self._korean_bounds_fit(item, safe, bounds):
+                        return True
+        # Failed candidates must not silently become exported pixels. Restore
+        # the complete editable translation and let the caller request review.
+        item.setFontSize(original_size)
+        item.setPlainText(text)
+        item.set_size(original_rect.width(), original_rect.height(), set_layout_maxsize=True)
+        item.setPos(item.pos() + original_rect.center() - item.absBoundingRect(qrect=True).center())
+        LOGGER.warning('Korean dialogue block %s needs layout review: no readable fit inside its balloon.', item.idx + 1)
+        return False
+
     def layout_textblk(self, blkitem: TextBlkItem, text: str = None, mask: np.ndarray = None, bounding_rect: List = None, region_rect: List = None):
         
         '''
@@ -890,6 +1206,9 @@ class SceneTextManager(QObject):
         # disable for vertical writing
         if blkitem.blk.vertical:
             return
+
+        if self.auto_textlayout_flag and pcfg.module.translate_target == '한국어' and text is not None:
+            return self._layout_korean_textblk(blkitem, text)
         
         old_br = blkitem.absBoundingRect(qrect=True)
         old_br = [old_br.x(), old_br.y(), old_br.width(), old_br.height()]

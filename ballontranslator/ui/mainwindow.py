@@ -5,10 +5,14 @@ from pathlib import Path
 import subprocess
 from functools import partial
 import time
+import copy
+import math
+
+import numpy as np
 
 from tqdm import tqdm
 from qtpy.QtWidgets import QAction, QFileDialog, QMenu, QHBoxLayout, QVBoxLayout, QApplication, QStackedWidget, QSplitter, QListWidget, QShortcut, QListWidgetItem, QMessageBox, QTextEdit, QPlainTextEdit, QDialog, QWidget, QColorDialog
-from qtpy.QtCore import Qt, QPoint, QSize, QEvent, Signal, QTimer
+from qtpy.QtCore import Qt, QPoint, QSize, QEvent, Signal, QTimer, QRectF
 from qtpy.QtGui import QContextMenuEvent, QTextCursor, QGuiApplication, QIcon, QCloseEvent, QKeySequence, QPainter, QClipboard, QColor
 
 from ballontranslator.utils.logger import logger as LOGGER
@@ -22,6 +26,7 @@ from ballontranslator.utils.text_effects import (
     with_primary_stroke,
 )
 from ballontranslator.utils import shared
+from ballontranslator.utils.local_edition import is_local_edition
 from ballontranslator.utils.message import create_error_dialog, create_info_dialog
 from ballontranslator.modules import GET_VALID_TEXTDETECTORS, GET_VALID_INPAINTERS, GET_VALID_TRANSLATORS, GET_VALID_OCR
 from .misc import parse_stylesheet, set_html_family, QKEY
@@ -43,10 +48,13 @@ from .text_engine.editing.widgets import SourceTextEdit, TransTextEdit
 from .drawingpanel import DrawingPanel
 from .text_engine.editing.manager import (
     PasteSrcItemsCommand,
+    RegionReworkCommand,
     SceneTextManager,
     SceneTextReplacementReason,
     TextPanel,
 )
+from .text_engine.item import TextBlkItem
+from .region_rework import RegionReworkRequest, RegionReworkResult
 from .mainwindowbars import TitleBar, LeftBar, BottomBar
 from .menu_style import install_app_style_filters
 from .io_thread import ImgSaveThread, ImportDocThread, ExportDocThread
@@ -164,6 +172,13 @@ class MainWindow(mainwindow_cls):
         self._render_only = False
         self._render_global_format = None
         self._llm_context_dirty = False
+        self.local_workspace = None
+        self._local_job_finished = False
+        self._local_output_dir = None
+        self._local_save_error = ''
+        self._continue_stage_baseline = {}
+        self._region_rework_pending = None
+        self._region_rework_revision = 0
 
         self.setupThread()
         self.setupUi()
@@ -192,7 +207,7 @@ class MainWindow(mainwindow_cls):
             self.showMaximized()
 
         show_release_info = exec_args.get('show_release_info', False)
-        if not shared.HEADLESS and (show_release_info or pcfg.check_update_on_startup):
+        if not shared.HEADLESS and not is_local_edition() and (show_release_info or pcfg.check_update_on_startup):
             # Defer startup update checks until the event loop can paint progress.
             QTimer.singleShot(
                 500,
@@ -204,11 +219,14 @@ class MainWindow(mainwindow_cls):
         # The callbacks cannot run until construction returns to the event loop.
         QTimer.singleShot(0, start_effect_paint_numba_warmup)
         QTimer.singleShot(0, start_grid_numba_warmup)
-        if not shared.HEADLESS:
+        if not shared.HEADLESS and not is_local_edition():
             from .codex_account import CodexAccountController
             # Restore persisted sign-in after all profile/selector listeners
             # exist. Credential IO and HTTP stay in the account worker.
             QTimer.singleShot(0, CodexAccountController.instance().restoreSession)
+        if not shared.HEADLESS and is_local_edition():
+            self.setup_local_workspace()
+            QTimer.singleShot(0, self.show_local_workspace)
 
     def setupThread(self):
         self.imsave_thread = ImgSaveThread()
@@ -240,6 +258,248 @@ class MainWindow(mainwindow_cls):
         self.auto_tate_chu_yoko_progress.showed.connect(
             self.on_imgtrans_progressbox_showed
         )
+
+    def setup_local_workspace(self) -> None:
+        from .local_workspace import LocalWorkspace
+        self.local_workspace = LocalWorkspace(self)
+        self.local_workspace.run_requested.connect(self.start_local_folder)
+        self.local_workspace.pause_requested.connect(self.pause_local_queue)
+        self.local_workspace.edit_requested.connect(self.open_local_editor)
+        self._local_pending_folder = None
+        self._local_render_pending = []
+        self._local_resume_pending = False
+        self._local_timer = QTimer(self)
+        self._local_timer.setInterval(300)
+        self._local_timer.timeout.connect(self.poll_local_queue)
+        self.local_action = QAction('로컬 번역 · 준비 / 일괄 작업', self)
+        self.local_action.setShortcut(QKeySequence('Ctrl+Shift+L'))
+        self.local_action.triggered.connect(self.show_local_workspace)
+        menu = self.titleBar.toolsToolBtn.menu()
+        menu.insertAction(menu.actions()[0], self.local_action)
+        self.region_rework_action = QAction(self.tr('영역 재작업'), self)
+        self.region_rework_action.setShortcut(QKeySequence('Ctrl+Shift+R'))
+        self.region_rework_action.triggered.connect(self.begin_region_rework)
+        menu.insertAction(self.local_action, self.region_rework_action)
+        self.addAction(self.region_rework_action)
+        self.leftBar.openBtn.menu().insertAction(self.leftBar.openBtn.menu().actions()[0], self.local_action)
+        self.addAction(self.local_action)
+        # Fixed local modules need no provider/account selector in the editor.
+        for selector in (self.bottomBar.textdet_selector, self.bottomBar.ocr_selector,
+                         self.bottomBar.trans_selector, self.bottomBar.inpaint_selector):
+            selector.setEnabled(False)
+        for action in self.titleBar.moduleVisibilityActions:
+            action.setVisible(False)
+        self.imsave_thread.save_failed.connect(self.on_local_image_save_failed)
+
+    def show_local_workspace(self) -> None:
+        if self.local_workspace is None:
+            return
+        self.local_workspace.show()
+        self.local_workspace.raise_()
+        self.local_workspace.activateWindow()
+
+    def open_local_editor(self, folder: str) -> None:
+        if self.conditional_save() is False:
+            create_info_dialog('현재 프로젝트를 저장하지 못했습니다. 저장 오류를 해결한 후 다시 열어 주세요.')
+            return
+        self.OpenProj(folder)
+        self._local_output_dir = self.local_workspace.queue.output_directory(folder)
+        pcfg.imgsave_ext = self.local_workspace.queue.format
+
+    def _local_pipeline_busy(self) -> bool:
+        manager = self.module_manager
+        return (
+            manager.imgtrans_thread.isRunning()
+            or manager._module_preparation_running()
+            or manager._pending_prepare_success is not None
+        )
+
+    def _local_layout_review_job(self) -> dict | None:
+        workspace = getattr(self, 'local_workspace', None)
+        directory = self.imgtrans_proj.directory
+        if workspace is None or directory is None:
+            return None
+        current_directory = Path(directory).resolve()
+        for index, job in enumerate(workspace.queue.jobs):
+            if current_directory == Path(job['folder']).resolve():
+                # A queued folder switch changes active_index before the old
+                # page's conditional save. Its review guard must survive that
+                # transition and the later idle editor state.
+                if index == workspace.active_index or self.imgtrans_proj.current_img in job.get('review_pages', []):
+                    return job
+                break
+        return None
+
+    def _hold_local_layout(self, block_indices: list[int]) -> None:
+        job = self._local_layout_review_job()
+        page = self.imgtrans_proj.current_img
+        blocks = ', '.join(str(index + 1) for index in block_indices)
+        error = f'{page} · 말풍선 {blocks}: 글자가 말풍선에 맞지 않습니다. 결과 검수에서 대사나 글자 배치를 수정한 뒤 재시도하세요.'
+        # Record the review before any output can be written. Translation and
+        # editable geometry remain in the project even when output is held.
+        if job is not None:
+            review_pages = job.setdefault('review_pages', [])
+            if page not in review_pages:
+                review_pages.append(page)
+            job['resave'] = True
+            if not self.local_workspace.save_queue():
+                error += ' 작업 목록을 저장하지 못했습니다.'
+        try:
+            self.st_manager.updateTextBlkList()
+            self.imgtrans_proj.save()
+            self._llm_context_dirty = False
+        except Exception as exc:
+            error += f' 프로젝트 저장 실패: {exc}'
+        self._local_save_error = error
+        self.canvas.setProjSaveState(True)
+        self.pause_local_queue()
+        LOGGER.warning(error)
+        workspace = getattr(self, 'local_workspace', None)
+        if workspace is not None:
+            workspace.status_label.setText(error)
+        elif not shared.HEADLESS:
+            create_info_dialog(error)
+
+    def start_local_folder(self, folder: str) -> None:
+        if self._local_pipeline_busy():
+            self.local_workspace.pause_pending = True
+            self.local_workspace.finish_job(False, '다른 작업이 실행 중입니다. 완료 후 재시도하세요.', 0, 0)
+            return
+        self._local_save_error = ''
+        self._local_presave_errors = self.imsave_thread.error_count
+        if self.conditional_save() is False:
+            self.local_workspace.pause_pending = True
+            self.local_workspace.finish_job(False, f'열려 있는 프로젝트 저장 실패: {self._local_save_error}', 0, 0)
+            return
+        # The previous page's save jobs must finish before replacing project
+        # identity or selecting another output destination.
+        self._local_pending_folder = folder
+        self._local_job_finished = False
+        self._local_timer.start()
+
+    def _begin_local_folder(self, folder: str) -> None:
+        workspace = self.local_workspace
+        self._local_save_error = ''
+        self._local_save_errors_before = self.imsave_thread.error_count
+        pcfg.imgsave_ext = workspace.queue.format
+        self._local_output_dir = workspace.queue.output_directory(folder)
+        if not self.openDir(folder) or self.imgtrans_proj.is_empty:
+            self._local_output_dir = None
+            workspace.finish_job(False, '폴더를 열 수 없거나 지원하는 이미지가 없습니다.', 0, 0)
+            return
+        pages = list(self.imgtrans_proj.pages)
+        job = workspace.queue.jobs[workspace.active_index]
+        if job.get('restart'):
+            self.imgtrans_proj.save(keep_exist_as_backup=True)
+            previous_review = job.get('review_pages', [])
+            job['restart'] = False
+            job['review_pages'] = []
+            if not workspace.save_queue():
+                job['restart'] = True
+                job['review_pages'] = previous_review
+                raise OSError('작업 목록을 저장하지 못하여 새로 번역을 중단했습니다.')
+            self.on_run_imgtrans(continue_mode=False)
+            return
+        review_pages = job.get('review_pages', [])
+        current_review = [page for page in review_pages if page in self.imgtrans_proj.pages]
+        if current_review != review_pages:
+            LOGGER.warning('Removing layout review entries for pages no longer in the project: %s', [page for page in review_pages if page not in self.imgtrans_proj.pages])
+            job['review_pages'] = current_review
+            if not workspace.save_queue():
+                job['review_pages'] = review_pages
+                raise OSError('작업 목록을 저장하지 못하여 이어서 번역을 중단했습니다.')
+        missing = []
+        for index, page in enumerate(pages):
+            if self.imgtrans_proj.get_page_progress(page):
+                output = self._local_output_dir / Path(self.imgtrans_proj.get_result_path(page)).name
+                if page in job.get('review_pages', []) or job.get('resave') or not output.is_file() or not Path(self.imgtrans_proj.get_result_path(page)).is_file():
+                    missing.append(index)
+        # Regenerate absent result files from completed project data without
+        # asking OCR/translation to overwrite manual edits.
+        self._local_render_pending = missing
+        self._local_resume_pending = True
+
+    def _resume_local_pipeline(self) -> None:
+        pages = list(self.imgtrans_proj.pages)
+        if all(self.imgtrans_proj.get_page_progress(page) for page in pages):
+            self._local_job_finished = True
+        else:
+            self.on_run_imgtrans(continue_mode=True)
+
+    def pause_local_queue(self) -> None:
+        self._local_render_pending = []
+        self._local_resume_pending = False
+        self.module_manager.stopImgtransPipeline()
+        self._local_job_finished = True
+
+    def on_local_image_save_failed(self, page: str, message: str) -> None:
+        self.canvas.setProjSaveState(True)
+        if self.local_workspace is not None and self.local_workspace.active_index is not None:
+            self._local_save_error = f'{page}: {message}'
+
+    def poll_local_queue(self) -> None:
+        workspace = self.local_workspace
+        if workspace.active_index is None:
+            self._local_timer.stop()
+            return
+        if self._local_pending_folder is not None:
+            if self.imsave_thread.isBusy():
+                return
+            folder, self._local_pending_folder = self._local_pending_folder, None
+            if self._local_save_error or self.imsave_thread.error_count != self._local_presave_errors:
+                workspace.pause_pending = True
+                workspace.finish_job(False, f'열려 있는 프로젝트 이미지 저장 실패: {self._local_save_error}', 0, 0)
+                return
+            if workspace.pause_pending:
+                workspace.finish_job(False, '', 0, 0)
+                return
+            try:
+                self._begin_local_folder(folder)
+            except Exception as exc:
+                self._local_save_error = str(exc)
+                self.module_manager.stopImgtransPipeline()
+                self._local_job_finished = True
+            return
+        if getattr(self, '_local_render_pending', None):
+            index = self._local_render_pending.pop(0)
+            self.pageList.setCurrentRow(index)
+            if self.pageList.currentRow() != index:
+                self._local_save_error = self._local_save_error or '페이지 전환 전 저장을 완료하지 못했습니다.'
+                self.pause_local_queue()
+                return
+            if not self.saveCurrentPage(False, False):
+                self.pause_local_queue()
+            return
+        if getattr(self, '_local_resume_pending', False):
+            self._local_resume_pending = False
+            self._resume_local_pipeline()
+            return
+        pages = list(self.imgtrans_proj.pages)
+        done = sum(self.imgtrans_proj.get_page_progress(page) for page in pages)
+        workspace.update_progress(done, len(pages), f'{done} / {len(pages)}장 처리 완료 · 원본은 유지됩니다.')
+        if not self._local_job_finished or self._local_pipeline_busy() or self.imsave_thread.isBusy():
+            return
+        error = self._local_save_error
+        try:
+            # Stopped workers can retain valid OCR/translation stages that have
+            # not reached page-finished. Snapshot only after all threads stop.
+            self.imgtrans_proj.save()
+        except Exception as exc:
+            error = f'프로젝트 저장 실패: {exc}'
+        if self.imsave_thread.error_count != self._local_save_errors_before:
+            error = error or '결과 이미지 저장 중 오류가 발생했습니다.'
+        failed = self.imgtrans_proj.failed_pages()
+        if failed:
+            error = error or f'처리 실패 {len(failed)}장. 준비 상태를 확인하고 재시도하세요.'
+        if not error and done != len(pages) and not workspace.pause_pending:
+            error = '완료되지 않은 페이지가 있습니다. 준비 상태를 확인하고 재시도하세요.'
+        if not error and done == len(pages):
+            missing = [page for page in pages if not (self._local_output_dir / Path(self.imgtrans_proj.get_result_path(page)).name).is_file()]
+            if missing:
+                error = f'결과 이미지 {len(missing)}개가 저장되지 않았습니다. 재시도하면 프로젝트에서 다시 저장합니다.'
+        self._local_output_dir = None
+        self._local_job_finished = False
+        workspace.finish_job(not workspace.pause_pending and not error and done == len(pages), error, done, len(pages))
 
     def resetStyleSheet(self):
         theme = 'eva-dark' if pcfg.darkmode else 'eva-light'
@@ -327,6 +587,8 @@ class MainWindow(mainwindow_cls):
         self.canvas.gv.hide_canvas.connect(self.onHideCanvas)
         self.canvas.proj_savestate_changed.connect(self.on_savestate_changed)
         self.canvas.textstack_changed.connect(self.on_textstack_changed)
+        self.canvas.textstack_changed.connect(self._region_history_changed)
+        self.canvas.draw_undo_stack.indexChanged.connect(self._region_history_changed)
         self.canvas.run_blktrans.connect(self.on_run_blktrans)
         self.canvas.drop_open_folder.connect(self.dropOpenDir)
         self.canvas.originallayer_trans_slider = self.bottomBar.originalSlider
@@ -338,6 +600,7 @@ class MainWindow(mainwindow_cls):
         self.bottomBar.editingLayerSlider.valueChanged.connect(self.canvas.setEditingLayerOpacityBySlider)
         
         self.drawingPanel = DrawingPanel(self.canvas)
+        self.drawingPanel.region_rework_requested.connect(self.on_region_rework_requested)
         self.textPanel = TextPanel(self.app)
         self.textPanel.formatpanel.foldTextBtn.checkStateChanged.connect(self.fold_textarea)
         self.textPanel.formatpanel.sourceBtn.checkStateChanged.connect(self.show_source_text)
@@ -450,7 +713,7 @@ class MainWindow(mainwindow_cls):
         elif module_key == 'inpainter':
             self.bottomBar.inpaint_selector.setSelectedValue(module_name)
             profile_id = pcfg.module.inpaint_llm_id
-        if profile_id:
+        if profile_id and self.configPanel.llm_profiles_panel is not None:
             self.configPanel.llm_profiles_panel.refreshSelectionBorders(profile_id)
 
     def validateModuleSelections(self) -> None:
@@ -497,6 +760,8 @@ class MainWindow(mainwindow_cls):
         # Preparation and RUN dialogs share placement so the first RUN is stable.
         module_manager.prepare_msgbox.showed.connect(self.on_imgtrans_progressbox_showed)
         module_manager.blktrans_pipeline_finished.connect(self.on_blktrans_finished)
+        module_manager.region_rework_finished.connect(self.on_region_rework_finished)
+        module_manager.region_rework_failed.connect(self.on_region_rework_failed)
         module_manager.imgtrans_thread.post_process_mask = self.drawingPanel.rectPanel.post_process_mask
         module_manager.translate_thread.finish_set_module.connect(self.on_finish_settranslator)
         self.setTranslatorSelectionFromMetadata(pcfg.module.translator)
@@ -522,19 +787,20 @@ class MainWindow(mainwindow_cls):
         for idx, action in enumerate(self.titleBar.moduleVisibilityActions):
             self._set_module_tool_visibility(idx, action.isChecked())
 
-        self.configPanel.llm_profiles_panel.profile_ui_updated.connect(self.on_llm_profile_ui_updated)
-        self.configPanel.llm_profiles_panel.profile_summary_changed.connect(self.on_llm_profile_summary_changed)
-        self.configPanel.codex_panel.profile_ui_updated.connect(self.on_llm_profile_ui_updated)
-        self.configPanel.codex_panel.profile_summary_changed.connect(self.on_llm_profile_summary_changed)
-        self.configPanel.llm_profiles_panel.set_translator_requested.connect(
-            self.bottomBar.trans_selector.menu.selectLLMProfile
-        )
-        self.configPanel.llm_profiles_panel.set_ocr_requested.connect(
-            self.bottomBar.ocr_selector.menu.selectLLMProfile
-        )
-        self.configPanel.llm_profiles_panel.set_inpainter_requested.connect(
-            self.bottomBar.inpaint_selector.menu.selectLLMProfile
-        )
+        if not is_local_edition():
+            self.configPanel.llm_profiles_panel.profile_ui_updated.connect(self.on_llm_profile_ui_updated)
+            self.configPanel.llm_profiles_panel.profile_summary_changed.connect(self.on_llm_profile_summary_changed)
+            self.configPanel.codex_panel.profile_ui_updated.connect(self.on_llm_profile_ui_updated)
+            self.configPanel.codex_panel.profile_summary_changed.connect(self.on_llm_profile_summary_changed)
+            self.configPanel.llm_profiles_panel.set_translator_requested.connect(
+                self.bottomBar.trans_selector.menu.selectLLMProfile
+            )
+            self.configPanel.llm_profiles_panel.set_ocr_requested.connect(
+                self.bottomBar.ocr_selector.menu.selectLLMProfile
+            )
+            self.configPanel.llm_profiles_panel.set_inpainter_requested.connect(
+                self.bottomBar.inpaint_selector.menu.selectLLMProfile
+            )
 
         self.drawingPanel.maskTransperancySlider.setValue(int(pcfg.mask_transparency * 100))
         self.leftBar.initRecentProjMenu(pcfg.recent_proj_list)
@@ -650,6 +916,8 @@ class MainWindow(mainwindow_cls):
         self.canvas.setProjSaveState(True)
 
     def check_for_updates(self, manual: bool = True, show_release_info: bool = False):
+        if is_local_edition():
+            return
         if self.update_thread.isBusy():
             LOGGER.info('Ignored update check request because an update check or update is already running.')
             return
@@ -789,7 +1057,7 @@ class MainWindow(mainwindow_cls):
         entries = registry.entries(only_custom, pcfg.excluded_fonts)
         self.textPanel.formatpanel.update_font_entries(entries)
 
-    def openDir(self, directory: str):
+    def openDir(self, directory: str) -> bool:
         try:
             self.opening_dir = True
             # 在加载项目前检查并生成TIF文件的预览图
@@ -804,10 +1072,11 @@ class MainWindow(mainwindow_cls):
             self.updatePageList()
             self._llm_context_dirty = False
             self.opening_dir = False
+            return True
         except Exception as e:
             self.opening_dir = False
             create_error_dialog(e, self.tr('Failed to load project ') + directory)
-            return
+            return False
 
     def generate_tif_thumbnails(self, directory: str):
         """
@@ -897,9 +1166,17 @@ class MainWindow(mainwindow_cls):
         save_config()
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        if self.font_change_detector is not None:
-            self.font_change_detector.stop()
-        self.font_refresh.shutdown()
+        if self.module_manager.regionReworkBusy():
+            self.module_manager.stopImgtransPipeline()
+            event.ignore()
+            create_info_dialog(self.tr('영역 재작업을 중지하고 있습니다. 작업 종료 후 다시 닫아 주세요.'))
+            return
+        workspace = getattr(self, 'local_workspace', None)
+        if workspace is not None and workspace.busy:
+            event.ignore()
+            self.show_local_workspace()
+            workspace.status_label.setText('진행 중인 작업을 먼저 중지하세요. 저장이 끝난 뒤 프로그램을 닫을 수 있습니다.')
+            return
         # Pending numeric edits are not dirty until they commit. Resolve them
         # before the close-time dirty check and final config snapshot.
         self.st_manager.formatpanel.resolve_text_transform_edits_for_save()
@@ -908,11 +1185,17 @@ class MainWindow(mainwindow_cls):
             self.auto_tate_chu_yoko_thread.request_stop()
             self.auto_tate_chu_yoko_thread.wait()
         if not self.imgtrans_proj.is_empty:
-            self.conditional_save(keep_exist_as_backup=True)
+            if self.conditional_save(keep_exist_as_backup=True) is False:
+                event.ignore()
+                return
+        if self.font_change_detector is not None:
+            self.font_change_detector.stop()
+        self.font_refresh.shutdown()
         while True:
-            if not self.imsave_thread.isRunning():
+            if not self.imsave_thread.isBusy():
                 break
-            time.sleep(0.1)
+            self.app.processEvents()
+            time.sleep(0.01)
         self.st_manager.hovering_transwidget = None
         self.st_manager.blockSignals(True)
         self.canvas.prepareClose()
@@ -946,7 +1229,7 @@ class MainWindow(mainwindow_cls):
     def onHideCanvas(self):
         self.canvas.clearToolStates()
 
-    def conditional_save(self, keep_exist_as_backup=False):
+    def conditional_save(self, keep_exist_as_backup=False) -> bool:
         if self.canvas.projstate_unsaved and not self.opening_dir:
             update_scene_text = self.canvas.text_change_unsaved()
             draw_changed = self.canvas.draw_change_unsaved()
@@ -964,16 +1247,18 @@ class MainWindow(mainwindow_cls):
                         'Failed to save LLM context edits: %s',
                         error,
                     )
-                    return
+                    self._local_save_error = str(error)
+                    return False
                 self._llm_context_dirty = False
                 self.canvas.setProjSaveState(False)
-                return
+                return True
             save_proj = update_scene_text or self._llm_context_dirty
             save_rst_only = not draw_changed
             if not save_rst_only:
                 save_proj = True
             
-            self.saveCurrentPage(update_scene_text, save_proj, restore_interface=True, save_rst_only=save_rst_only, keep_exist_as_backup=keep_exist_as_backup)
+            return self.saveCurrentPage(update_scene_text, save_proj, restore_interface=True, save_rst_only=save_rst_only, keep_exist_as_backup=keep_exist_as_backup)
+        return True
 
     def pageListCurrentItemChanged(self):
         item = self.pageList.currentItem()
@@ -984,7 +1269,16 @@ class MainWindow(mainwindow_cls):
                 # before its dirty check. Live drags are previews and cancel.
                 self.st_manager.formatpanel.resolve_text_transform_edits_for_page_change()
             if self.save_on_page_changed:
-                self.conditional_save()
+                if self.conditional_save() is False:
+                    signals_blocked = self.pageList.blockSignals(True)
+                    try:
+                        pages = list(self.imgtrans_proj.pages)
+                        current_page = self.imgtrans_proj.current_img
+                        self.pageList.setCurrentRow(pages.index(current_page) if current_page in pages else -1)
+                    finally:
+                        self.pageList.blockSignals(signals_blocked)
+                    self.page_changing = False
+                    return
             self.st_manager.clearSceneTextitems(
                 SceneTextReplacementReason.PAGE_CHANGE
             )
@@ -1613,18 +1907,29 @@ class MainWindow(mainwindow_cls):
     def manual_save(self) -> None:
         if self.imgtrans_proj.directory is not None:
             LOGGER.debug('Manually saving...')
-            self.saveCurrentPage(update_scene_text=True, save_proj=True, restore_interface=True, save_rst_only=False)
+            self.saveCurrentPage(update_scene_text=True, save_proj=True, restore_interface=True, save_rst_only=False, check_local_layout=False)
 
-    def saveCurrentPage(self, update_scene_text=True, save_proj=True, restore_interface=False, save_rst_only=False, keep_exist_as_backup=False):
+    def saveCurrentPage(self, update_scene_text=True, save_proj=True, restore_interface=False, save_rst_only=False, keep_exist_as_backup=False, check_local_layout: bool = True) -> bool:
         
         if not self.imgtrans_proj.img_valid:
-            return
+            return True
+        saved = True
 
         if update_scene_text or save_proj:
             # Resolve text-transform editor state before both the canonical
             # project snapshot and the result-image render consume it. The
             # render-only translation completion path saves its project first.
             self.st_manager.formatpanel.resolve_text_transform_edits_for_save()
+
+        workspace = getattr(self, 'local_workspace', None)
+        review_job = self._local_layout_review_job() if check_local_layout and workspace is not None else None
+        reviewed_page = review_job is not None and self.imgtrans_proj.current_img in review_job.get('review_pages', [])
+        local_auto_layout = check_local_layout and is_local_edition() and pcfg.let_autolayout_flag
+        if local_auto_layout or review_job is not None and (pcfg.let_autolayout_flag or reviewed_page):
+            failed_blocks = [item.idx for item in self.st_manager.textblk_item_list if not self.st_manager.korean_layout_fits(item)]
+            if failed_blocks:
+                self._hold_local_layout(failed_blocks)
+                return False
 
         if restore_interface:
             set_canvas_focus = self.canvas.hasFocus()
@@ -1674,17 +1979,35 @@ class MainWindow(mainwindow_cls):
                         self.imsave_thread.saveImg(inpainted_path, inpainted, save_params={'ext': pcfg.intermediate_imgsave_ext}, keep_alpha=self.imgtrans_proj.current_has_alpha())
             except Exception as e:
                 LOGGER.error(f"Failed to save project files: {e}")
+                self._local_save_error = str(e)
+                saved = False
 
         # Render the final result image properly
         try:
             img = self.canvas.render_result_img()
             imsave_path = self.imgtrans_proj.get_result_path(self.imgtrans_proj.current_img)
             self.imsave_thread.saveImg(imsave_path, img, self.imgtrans_proj.current_img, save_params={'ext': pcfg.imgsave_ext, 'quality': pcfg.imgsave_quality}, keep_alpha=self.imgtrans_proj.current_has_alpha())
-            self.canvas.setProjSaveState(False)
-            self.canvas.update_saved_undostep()
+            output_dir = getattr(self, '_local_output_dir', None)
+            if output_dir is not None and Path(imsave_path).parent.resolve() != output_dir.resolve():
+                self.imsave_thread.saveImg(str(output_dir / Path(imsave_path).name), img, self.imgtrans_proj.current_img, save_params={'ext': pcfg.imgsave_ext, 'quality': pcfg.imgsave_quality}, keep_alpha=self.imgtrans_proj.current_has_alpha())
+            if saved and reviewed_page:
+                review_pages = review_job['review_pages']
+                review_job['review_pages'] = [page for page in review_pages if page != self.imgtrans_proj.current_img]
+                if not workspace.save_queue():
+                    review_job['review_pages'] = review_pages
+                    self._local_save_error = '말풍선 확인 상태를 저장하지 못했습니다.'
+                    saved = False
+            if saved:
+                self.canvas.setProjSaveState(False)
+                self.canvas.update_saved_undostep()
         
         except Exception as e:
             LOGGER.error(f"Failed to render and save result image: {e}")
+            self._local_save_error = str(e)
+            saved = False
+
+        if not saved:
+            self.canvas.setProjSaveState(True)
 
         if restore_interface:
             if restore_textblock_mode:
@@ -1701,6 +2024,7 @@ class MainWindow(mainwindow_cls):
                 self.canvas.block_selection_signal = False
             if editing_textitem is not None:
                 editing_textitem.startEdit()
+        return saved
         
     def to_trans_config(self):
         self.show_module_param_dialog('translator', pcfg.module.translator)
@@ -1826,7 +2150,8 @@ class MainWindow(mainwindow_cls):
         if profile_id:
             pcfg.module.translator_llm_id = profile_id
             self.configPanel.syncLLMProfile(profile_id)
-            self.configPanel.llm_profiles_panel.setSelectedProfile('translator', profile_id)
+            if self.configPanel.llm_profiles_panel is not None:
+                self.configPanel.llm_profiles_panel.setSelectedProfile('translator', profile_id)
         self.bottomBar.trans_selector.updateButtonText()
         self.llm_profile_selection_changed.emit()
 
@@ -1834,7 +2159,8 @@ class MainWindow(mainwindow_cls):
         if profile_id:
             pcfg.module.ocr_llm_id = profile_id
             self.configPanel.syncLLMProfile(profile_id)
-            self.configPanel.llm_profiles_panel.setSelectedProfile('ocr', profile_id)
+            if self.configPanel.llm_profiles_panel is not None:
+                self.configPanel.llm_profiles_panel.setSelectedProfile('ocr', profile_id)
         self.bottomBar.ocr_selector.updateButtonText()
         self.llm_profile_selection_changed.emit()
 
@@ -1842,7 +2168,8 @@ class MainWindow(mainwindow_cls):
         if profile_id:
             pcfg.module.inpaint_llm_id = profile_id
             self.configPanel.syncLLMProfile(profile_id)
-            self.configPanel.llm_profiles_panel.setSelectedProfile('inpainter', profile_id)
+            if self.configPanel.llm_profiles_panel is not None:
+                self.configPanel.llm_profiles_panel.setSelectedProfile('inpainter', profile_id)
         self.bottomBar.inpaint_selector.updateButtonText()
         self.llm_profile_selection_changed.emit()
 
@@ -1925,7 +2252,10 @@ class MainWindow(mainwindow_cls):
         self._run_imgtrans_wo_textstyle_update = False
         self._render_only = False
         self._render_global_format = None
-        if pcfg.module.empty_runcache and not shared.HEADLESS:
+        workspace = getattr(self, 'local_workspace', None)
+        if workspace is not None and workspace.active_index is not None:
+            self._local_job_finished = True
+        if pcfg.module.empty_runcache and not shared.HEADLESS and not is_local_edition():
             self.module_manager.unload_all_models()
         if shared.args.export_translation_txt:
             self.on_export_txt('translation')
@@ -1952,7 +2282,11 @@ class MainWindow(mainwindow_cls):
         if len(self.backup_blkstyles) == self.imgtrans_proj.num_pages and len(self.backup_blkstyles[page_index]) == len(blk_list):
             ffmt_list: List[FontFormat] = self.backup_blkstyles[page_index]
 
-        self.postprocess_translations(blk_list)
+        stage_baseline = getattr(self, '_continue_stage_baseline', {})
+        baseline = stage_baseline.get(list(self.imgtrans_proj.pages)[page_index], 0) if stage_baseline else 0
+        preserve_format = bool(baseline & RunStatus.FIN_TRANSLATE)
+        if not preserve_format:
+            self.postprocess_translations(blk_list)
                 
         # override font format if necessary
         override_fnt_size = pcfg.let_fntsize_flag == 1
@@ -1967,15 +2301,15 @@ class MainWindow(mainwindow_cls):
         if gf is None:
             gf = self.textPanel.formatpanel.global_format
 
-        enable_detect = pcfg.module.enable_detect and not self._render_only
-        enable_ocr = pcfg.module.enable_ocr and not self._render_only
-        enable_translate = pcfg.module.enable_translate and not self._render_only
+        enable_detect = pcfg.module.enable_detect and not self._render_only and not (baseline & RunStatus.FIN_DET)
+        enable_ocr = pcfg.module.enable_ocr and not self._render_only and not (baseline & RunStatus.FIN_OCR)
+        enable_translate = pcfg.module.enable_translate and not self._render_only and not (baseline & RunStatus.FIN_TRANSLATE)
         enable_inpaint = pcfg.module.enable_inpaint and not self._render_only
         inpaint_only = enable_inpaint and not (
             enable_detect or enable_ocr or enable_translate
         )
         
-        if not inpaint_only:
+        if not inpaint_only and not preserve_format:
             for ii, blk in enumerate(blk_list):
                 if self._run_imgtrans_wo_textstyle_update and ffmt_list is not None:
                     blk.fontformat.merge(ffmt_list[ii])
@@ -2067,8 +2401,15 @@ class MainWindow(mainwindow_cls):
             self.st_manager.auto_textlayout_flag = pcfg.let_autolayout_flag and \
                 (enable_detect or enable_translate)
         
+        if preserve_format:
+            self.st_manager.auto_textlayout_flag = False
+
         if page_index != self.pageList.currentIndex().row():
             self.pageList.setCurrentRow(page_index)
+            if self.pageList.currentIndex().row() != page_index:
+                self._local_save_error = getattr(self, '_local_save_error', '') or '페이지 전환 전 저장을 완료하지 못했습니다.'
+                self.module_manager.stopImgtransPipeline()
+                return
         else:
             self.imgtrans_proj.set_current_img_byidx(page_index)
             self.canvas.updateCanvas()
@@ -2083,8 +2424,22 @@ class MainWindow(mainwindow_cls):
 
         self.llmContextEditor.refresh_context()
 
+        workspace = getattr(self, 'local_workspace', None)
+        local_layout = is_local_edition() or workspace is not None and self._local_layout_review_job() is not None
+        if local_layout and self.st_manager.auto_layout_failed:
+            self._hold_local_layout(self.st_manager.auto_layout_failed)
+            return
+
         # save proj file on page trans finished
-        self.imgtrans_proj.save()
+        try:
+            self.imgtrans_proj.save()
+        except Exception as exc:
+            if is_local_edition():
+                self._local_save_error = f'프로젝트 저장 실패: {exc}'
+                self.module_manager.stopImgtransPipeline()
+                self.canvas.setProjSaveState(True)
+                return
+            raise
         self._llm_context_dirty = False
 
         self.saveCurrentPage(False, False)
@@ -2105,6 +2460,193 @@ class MainWindow(mainwindow_cls):
     def on_run_blktrans(self, mode: int):
         blkitem_list = self.canvas.selected_text_items()
         self.translateBlkitemList(blkitem_list, mode)
+
+    def _region_history_changed(self, *_args: object) -> None:
+        self._region_rework_revision += 1
+
+    def _region_scene_fingerprint(self) -> tuple:
+        """Capture live text and page-space geometry without publishing edits.
+
+        >>> callable(MainWindow._region_scene_fingerprint)
+        True
+        """
+        return tuple(
+            (id(item), pair.e_source.toPlainText(), item.toHtml(),
+             repr(item.get_fontformat()), tuple(item.absBoundingRect()),
+             item.rotation(), repr(item.blk.xyxy), repr(item.blk.lines))
+            for item, pair in zip(self.st_manager.textblk_item_list,
+                                  self.st_manager.pairwidget_list)
+        )
+
+    def begin_region_rework(self) -> None:
+        if not is_local_edition() or self.imgtrans_proj.img_array is None:
+            create_info_dialog(self.tr('먼저 재작업할 이미지 폴더를 열어 주세요.'))
+            return
+        workspace = self.local_workspace
+        if (workspace is not None and workspace.busy
+                or self.module_manager.regionReworkBusy()
+                or self._local_pipeline_busy() or self.imsave_thread.isBusy()):
+            create_info_dialog(self.tr('진행 중인 작업과 저장이 끝난 뒤 영역을 선택해 주세요.'))
+            return
+        if not self.bottomBar.paintChecker.isChecked():
+            self.bottomBar.paintChecker.click()
+        self.drawingPanel.begin_region_rework()
+
+    def on_region_rework_requested(self, rect: object) -> None:
+        workspace = self.local_workspace
+        if (not is_local_edition() or self.imgtrans_proj.img_array is None
+                or workspace is not None and workspace.busy
+                or self.module_manager.regionReworkBusy()
+                or self._local_pipeline_busy() or self.imsave_thread.isBusy()):
+            create_info_dialog(self.tr('진행 중인 작업과 저장이 끝난 뒤 영역을 다시 선택해 주세요.'))
+            return
+        self.st_manager.formatpanel.resolve_text_transform_edits_for_save()
+        QApplication.inputMethod().commit()
+        editing = self.canvas.editing_textblkitem
+        if editing is not None and editing.isEditing():
+            editing.endEdit(keep_focus=False)
+        QApplication.inputMethod().reset()
+        self.st_manager.updateTextBlkList()
+        project = self.imgtrans_proj
+        try:
+            if len(rect) != 4 or not all(math.isfinite(float(value)) for value in rect):
+                raise ValueError
+            height, width = project.img_array.shape[:2]
+            left, right = sorted((float(rect[0]), float(rect[2])))
+            top, bottom = sorted((float(rect[1]), float(rect[3])))
+            region = (max(0, math.floor(left)), max(0, math.floor(top)),
+                      min(width, math.ceil(right)), min(height, math.ceil(bottom)))
+            x1, y1, x2, y2 = region
+            if x1 >= x2 or y1 >= y2:
+                raise ValueError
+            selection = QRectF(x1, y1, x2 - x1, y2 - y1)
+            old_items = []
+            for item in self.st_manager.textblk_item_list:
+                bx1, by1, bx2, by2 = item.blk.xyxy
+                source = QRectF(bx1, by1, bx2 - bx1, by2 - by1).normalized()
+                lines = np.asarray(item.blk.lines)
+                if lines.size:
+                    points = lines.reshape(-1, 2)
+                    lx1, ly1 = points.min(axis=0)
+                    lx2, ly2 = points.max(axis=0)
+                    source = source.united(QRectF(float(lx1), float(ly1),
+                                                 float(lx2-lx1), float(ly2-ly1)))
+                rendered = item.mapRectToParent(item.boundingRect())
+                if selection.intersects(source) or selection.intersects(rendered):
+                    if not selection.contains(source) or not selection.contains(rendered):
+                        create_info_dialog(self.tr('선택 경계에 걸친 대사가 있습니다. 원문과 번역 글자가 모두 포함되도록 말풍선 전체를 선택해 주세요.'))
+                        return
+                    old_items.append(item)
+            if project.inpainted_array is None or project.mask_array is None:
+                raise ValueError
+        except (TypeError, ValueError, OverflowError):
+            create_info_dialog(self.tr('재작업할 이미지 안에서 유효한 영역을 선택해 주세요.'))
+            return
+        snapshot = copy.copy(project)
+        snapshot.pages = copy.deepcopy(project.pages)
+        snapshot._image_info = copy.deepcopy(project._image_info)
+        snapshot._llm_compact_memory = copy.deepcopy(project._llm_compact_memory)
+        snapshot._raster_asset_cache = {}
+        snapshot.img_array = project.img_array.copy()
+        snapshot.inpainted_array = project.inpainted_array.copy()
+        snapshot.mask_array = project.mask_array.copy()
+        request = RegionReworkRequest(
+            region, snapshot.img_array, snapshot.inpainted_array, snapshot.mask_array,
+            snapshot, project.current_img, tuple(item.idx for item in old_items),
+            self.drawingPanel.rectPanel.dilate_slider.value(),
+        )
+        # Preparation may synchronously fail, so publish the guard first.
+        self._region_rework_pending = (
+            project, project._load_identity, project.current_img, region, old_items,
+            self._region_scene_fingerprint(), self._region_rework_revision,
+        )
+        if not self.module_manager.runRegionRework(request):
+            self.on_region_rework_failed(self.tr('다른 작업이 진행 중입니다. 종료 후 다시 선택해 주세요.'))
+
+    def _prepare_region_blocks(self, result: RegionReworkResult) -> tuple[list[TextBlock], bool]:
+        x1, y1, x2, y2 = result.rect
+        selection = QRectF(x1, y1, x2 - x1, y2 - y1)
+        prepared = []
+        review_needed = False
+        manager = self.st_manager
+        previous_auto_layout = manager.auto_textlayout_flag
+        manager.auto_textlayout_flag = True
+        try:
+            for original in result.blocks:
+                block = copy.deepcopy(original)
+                detected_size = block.font_size
+                block.fontformat = self.textPanel.formatpanel.global_format.deepcopy()
+                if pcfg.let_fntsize_flag == 0 and detected_size > 0:
+                    block.font_size = detected_size
+                block.vertical = False
+                block.alignment = TextAlignment.Center
+                block.rich_text = ''
+                text = block.translation
+                block.translation = ''
+                item = TextBlkItem(block, len(manager.pairwidget_list) + len(prepared),
+                                   show_rect=False)
+                try:
+                    fitted = manager.layout_textblk(item, text=text)
+                    review_needed = review_needed or fitted is not True
+                    if not item.toPlainText().strip():
+                        item.setPlainText(text)
+                    paint = item.mapRectToParent(item.boundingRect())
+                    minimum_height, minimum_width = item.layout.minSize()
+                    logical = item.logical_unpadded_rect()
+                    if (not selection.contains(paint)
+                            or re.sub(r'\s+', '', item.toPlainText()) != re.sub(r'\s+', '', text)
+                            or minimum_width > logical.width() + .5
+                            or minimum_height > logical.height() + .5
+                            or not all(math.isfinite(value) for value in
+                                       (paint.left(), paint.top(), paint.right(), paint.bottom()))):
+                        raise ValueError('region layout overflow')
+                    block.translation = item.toPlainText()
+                    block.rich_text = item.toHtml()
+                    block._bounding_rect = item.absBoundingRect()
+                    item.updateBlkFormat()
+                    prepared.append(block)
+                finally:
+                    item.geometry_controller.release_render_resources()
+                    item.deleteLater()
+        finally:
+            manager.auto_textlayout_flag = previous_auto_layout
+        if not prepared:
+            raise ValueError('region has no dialogue')
+        return prepared, review_needed
+
+    def on_region_rework_finished(self, result: RegionReworkResult) -> None:
+        pending = self._region_rework_pending
+        self._region_rework_pending = None
+        if pending is None:
+            return
+        project, identity, page, rect, old_items, fingerprint, revision = pending
+        self.st_manager.formatpanel.resolve_text_transform_edits_for_history_change()
+        QApplication.inputMethod().commit()
+        if (self.imgtrans_proj is not project or project._load_identity is not identity
+                or project.current_img != page or result.rect != rect
+                or self._region_rework_revision != revision
+                or self._region_scene_fingerprint() != fingerprint):
+            create_info_dialog(self.tr('작업 중 페이지나 대사가 바뀌어 결과를 적용하지 않았습니다. 영역을 다시 선택해 주세요.'))
+            return
+        try:
+            prepared, review_needed = self._prepare_region_blocks(result)
+            command = RegionReworkCommand(self.st_manager, old_items, prepared,
+                                          rect, result.inpainted, result.mask)
+        except Exception:
+            create_info_dialog(self.tr('번역 글자를 선택 영역 안에 안전하게 배치하지 못했습니다. 기존 결과는 유지됩니다. 영역을 넓히거나 대사를 직접 수정해 주세요.'))
+            return
+        self.canvas.push_text_command(command)
+        self.bottomBar.paintChecker.setChecked(False)
+        self.bottomBar.texteditChecker.setChecked(True)
+        self.setTextEditMode()
+        self.llmContextEditor.refresh_context()
+        self.global_search_widget.set_document_edited()
+        if review_needed:
+            create_info_dialog(self.tr('선택 영역 재작업을 완료했습니다. 배경 위 대사 등 말풍선 경계를 확인하기 어려운 글자는 배치를 직접 확인해 주세요. Ctrl+Z로 되돌릴 수 있습니다.'))
+
+    def on_region_rework_failed(self, message: str) -> None:
+        self._region_rework_pending = None
+        create_info_dialog(message or self.tr('영역 재작업에 실패했습니다. 기존 결과는 유지됩니다.'))
 
     def on_blktrans_finished(self, mode: int, blk_ids: List[int]):
 
@@ -2178,6 +2720,9 @@ class MainWindow(mainwindow_cls):
             self.set_display_lang(lang)
     
     def run_imgtrans(self) -> None:
+        if is_local_edition():
+            self.show_local_workspace()
+            return
         dialog = RunPipelineDialog(
             self,
             project=self.imgtrans_proj,
@@ -2218,6 +2763,10 @@ class MainWindow(mainwindow_cls):
         pages_to_process=None,
     ):
         self.backup_blkstyles.clear()
+        self._continue_stage_baseline = {
+            name: getattr(self.imgtrans_proj, '_image_info', {}).get(name, {}).get('finish_code', 0)
+            for name in self.imgtrans_proj.pages
+        } if continue_mode else {}
         self._render_only = render_only
         self._render_global_format = (
             self.textPanel.formatpanel.global_format.deepcopy()
@@ -2279,7 +2828,7 @@ class MainWindow(mainwindow_cls):
             for page in requested_pages:
                 if not pcfg.module.keep_exist_textlines and not continue_mode:
                     self.imgtrans_proj.pages[page].clear()
-        else:
+        elif not continue_mode:
             self.st_manager.updateTextBlkList()
             for page_name in requested_pages:
                 blklist = self.imgtrans_proj.pages[page_name]
@@ -2297,6 +2846,7 @@ class MainWindow(mainwindow_cls):
         self.module_manager.runImgtransPipeline(
             pipeline_pages,
             render_only=render_only,
+            **({'continue_mode': True} if continue_mode else {}),
         )
 
     def on_transpanel_changed(self) -> None:

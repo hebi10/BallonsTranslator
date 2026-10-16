@@ -19,6 +19,7 @@ LANGSET_CH = {'简体中文', '繁體中文'}
 
 PUNSET_RIGHT_ENG = {'.', '?', '!', ':', ';', ')', '}', "\""}
 PUNCTUATION_L = {'「', '『', '【', '《', '〈', '〔', '［', '｛', '（', '(', '[', '{', '“', '‘'}
+PUNCTUATION_R = set('」』】》〉〕］｝）)]}”’.,!?;:。，！？：；、…')
 SENTENCE_TERMINATORS = frozenset('.!?。！？')
 
 PKUSEG_PUNCSET = {' ', '.', '　'}
@@ -213,6 +214,38 @@ def seg_eng(text: str) -> List[str]:
         words.append(word)
     return words
 
+
+def seg_ko(text: str) -> List[str]:
+    """Keep Korean word boundaries and exact whitespace for measured wrapping.
+
+    >>> seg_ko('난 네 곁에 있을 거야.')
+    ['난 ', '네 ', '곁에 ', '있을 ', '거야.']
+    >>> ''.join(seg_ko('그는 “ 가자 ” 라고 말했다.'))
+    '그는 “ 가자 ” 라고 말했다.'
+    """
+    words: List[str] = []
+    for word in re.findall(r'\r\n|[\r\n]|\S+[^\S\r\n]*|[^\S\r\n]+', text):
+        if not words or '\n' in word or '\r' in word:
+            words.append(word)
+            continue
+        previous = words[-1]
+        if '\n' in previous or '\r' in previous:
+            words.append(word)
+            continue
+        previous_text = previous.rstrip()
+        current_text = word.lstrip()
+        if not previous_text or (
+            current_text and (
+                previous_text[-1] in PUNCTUATION_L
+                or current_text[0] in PUNCTUATION_R
+            )
+        ):
+            words[-1] += word
+        else:
+            words.append(word)
+    return words
+
+
 def _seg_ch_pkg(text: str) -> List[str]:
 
     if text == ' ':
@@ -343,12 +376,14 @@ def seg_ch_pkg(text: str):
         result_list = [half_len(word) for word in result_list]
     return result_list
 
-def seg_text(text: str, lang: str) -> Tuple[List, str]:
+def seg_text(text: str, lang: str) -> Tuple[List[str], str]:
     delimiter = ''
     if lang in LANGSET_CH:
         words = seg_ch_pkg(text)    
     elif lang in LANGSET_CJK:
         words = seg_to_chars(text)
+    elif lang == '한국어':
+        words = seg_ko(text)
     else:
         words = seg_eng(text)
         delimiter = ' '
