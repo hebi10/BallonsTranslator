@@ -1,11 +1,14 @@
 """Native transport for the one model served by the private local runtime."""
 
 import http.client
+import io
 import json
 import re
-import socket
+import select
 import threading
+import time
 from contextlib import contextmanager
+from functools import partial
 from typing import Callable, Dict, Optional
 
 MODEL_TAG = 'qwen3.5:9b-q4_K_M'
@@ -27,6 +30,49 @@ def _check_cancel(stop_event: Optional[threading.Event]) -> None:
         raise LocalOperationCancelled('작업이 중단되었습니다. 완료한 작업은 보존됩니다.')
 
 
+class _CancellableReader(io.RawIOBase):
+    """Poll a nonblocking socket inside the consuming worker on every raw read."""
+
+    def __init__(self, raw, sock, stop_event, timeout):
+        self.raw, self.sock = raw, sock
+        self.stop_event, self.timeout = stop_event, timeout
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        if not len(buffer):
+            return 0
+        deadline = time.monotonic() + self.timeout
+        while True:
+            _check_cancel(self.stop_event)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError('Timed out waiting for the local model response')
+            ready, _, _ = select.select([self.sock], [], [], min(0.1, remaining))
+            if ready:
+                # SocketIO returns None if readiness changed before recv. The
+                # nonblocking socket never re-enters a long Windows wait.
+                count = self.raw.readinto(buffer)
+                if count is not None:
+                    return count
+
+    def close(self):
+        try:
+            self.raw.close()
+        finally:
+            super().close()
+
+
+class _CancellableResponse(http.client.HTTPResponse):
+    def __init__(self, sock, *args, stop_event=None, read_timeout=300, **kwargs):
+        super().__init__(sock, *args, **kwargs)
+        # No headers have been read yet. Preserve the socket file's ownership
+        # while retaining HTTPResponse's normal buffering and chunk decoding.
+        raw = self.fp.detach()
+        self.fp = io.BufferedReader(_CancellableReader(raw, sock, stop_event, read_timeout))
+
+
 class OllamaClient:
     """Use a fixed loopback socket; environment proxies and redirects are ignored.
 
@@ -42,34 +88,18 @@ class OllamaClient:
                   read_timeout: Optional[float] = None):
         _check_cancel(stop_event)
         connection = http.client.HTTPConnection(OLLAMA_HOST, OLLAMA_PORT, timeout=5)
-        finished = threading.Event()
-        transport_socket = None
-
-        def cancel_socket() -> None:
-            while not finished.wait(0.1):
-                if stop_event is not None and stop_event.is_set():
-                    # HTTP/1.0 or Connection: close can transfer ownership to
-                    # HTTPResponse and clear connection.sock before body reads.
-                    sock = transport_socket
-                    if sock is not None:
-                        try:
-                            sock.shutdown(socket.SHUT_RDWR)
-                        except OSError:
-                            pass
-                    return
-
-        watcher = None
+        timeout = read_timeout if read_timeout is not None else (300 if payload is not None else 5)
+        connection.response_class = partial(
+            _CancellableResponse, stop_event=stop_event, read_timeout=timeout,
+        )
+        response = None
         try:
             connection.connect()
-            transport_socket = connection.sock
             _check_cancel(stop_event)
-            connection.sock.settimeout(read_timeout if read_timeout is not None else (300 if payload is not None else 5))
-            if stop_event is not None:
-                watcher = threading.Thread(target=cancel_socket, daemon=True)
-                watcher.start()
             body = json.dumps(payload, ensure_ascii=False).encode('utf-8') if payload is not None else None
             connection.request('POST' if payload is not None else 'GET', path, body,
                                {'Content-Type': 'application/json'})
+            connection.sock.setblocking(False)
             response = connection.getresponse()
             if response.status != 200:
                 # Never follow a Location header, even if it points to another local service.
@@ -84,10 +114,9 @@ class OllamaClient:
                 '모델 로드 중이라면 메모리와 Ollama 실행 로그도 확인해 주세요.'
             ) from error
         finally:
-            finished.set()
+            if response is not None:
+                response.close()
             connection.close()
-            if watcher is not None:
-                watcher.join(timeout=0.3)
 
     def _json(self, path: str) -> dict:
         with self._response(path) as response:

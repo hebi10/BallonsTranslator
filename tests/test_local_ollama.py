@@ -1,4 +1,6 @@
+import http.client
 import json
+import socket
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -31,7 +33,11 @@ def server(monkeypatch):
         def do_POST(self):
             body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
             state['requests'].append((self.path, body))
+            if state.get('chunked'):
+                self.protocol_version = 'HTTP/1.1'
             self.send_response(200)
+            if state.get('chunked'):
+                self.send_header('Transfer-Encoding', 'chunked')
             self.end_headers()
             if state.get('stall'):
                 state['started'].set()
@@ -48,7 +54,13 @@ def server(monkeypatch):
             if state['truncated']:
                 items = items[:-1]
             for item in items:
-                self.wfile.write(json.dumps(item).encode() + b'\n')
+                line = json.dumps(item).encode() + b'\n'
+                if state.get('chunked'):
+                    self.wfile.write(f'{len(line):x}\r\n'.encode() + line + b'\r\n')
+                else:
+                    self.wfile.write(line)
+            if state.get('chunked'):
+                self.wfile.write(b'0\r\n\r\n')
 
     httpd = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
@@ -82,6 +94,22 @@ def test_native_chat_disables_thinking_and_keeps_schema(server):
     assert body['format'] == schema
     assert body['options']['num_ctx'] == 8192
     assert body['options']['num_predict'] == 200
+
+
+def test_chunked_http11_stream_uses_normal_http_decoding(server):
+    server['chunked'] = True
+    assert local_ollama.OllamaClient().test_translation() == '안녕하세요'
+
+
+def test_cancellable_reader_preserves_response_timeout(server):
+    server.update(stall=True, started=threading.Event(), release=threading.Event())
+    try:
+        with pytest.raises(RuntimeError) as error:
+            with local_ollama.OllamaClient()._response('/api/chat', {}, read_timeout=0.1) as response:
+                response.read(1)
+        assert isinstance(error.value.__cause__, TimeoutError)
+    finally:
+        server['release'].set()
 
 
 def test_cloud_model_rejected_before_request(server):
@@ -166,10 +194,22 @@ def test_existing_translator_contract_reaches_native_ollama(server, monkeypatch)
 
 
 @pytest.mark.parametrize('operation', ['test_translation', 'unload'])
-def test_stalled_model_test_can_be_cancelled(server, operation):
+def test_stalled_model_test_can_be_cancelled(server, operation, monkeypatch):
     server.update(stall=True, started=threading.Event(), release=threading.Event())
     stop = threading.Event()
     errors = []
+    reading = threading.Event()
+    method = 'read' if operation == 'unload' else 'readline'
+    original_read = getattr(http.client.HTTPResponse, method)
+
+    def signal_read(response, *args, **kwargs):
+        reading.set()
+        return original_read(response, *args, **kwargs)
+
+    monkeypatch.setattr(http.client.HTTPResponse, method, signal_read)
+    # Windows may leave a pending buffered read waiting after another thread
+    # calls shutdown. Cancellation must also work without that wakeup.
+    monkeypatch.setattr(socket.socket, 'shutdown', lambda *_: None)
 
     def request():
         try:
@@ -181,6 +221,7 @@ def test_stalled_model_test_can_be_cancelled(server, operation):
     worker.start()
     try:
         assert server['started'].wait(2)
+        assert reading.wait(2)
         stop.set()
         worker.join(timeout=2)
         assert not worker.is_alive()
