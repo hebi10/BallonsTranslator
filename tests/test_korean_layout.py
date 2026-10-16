@@ -1,5 +1,7 @@
 import copy
+import math
 import os
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -10,7 +12,8 @@ from PIL import Image
 
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 
-from qtpy.QtCore import QCoreApplication, QEvent
+from qtpy.QtCore import QCoreApplication, QEvent, QRectF
+from qtpy.QtGui import QFont, QFontInfo, QFontMetricsF, QTextBlockFormat, QTextCursor, QTextDocument
 from qtpy.QtWidgets import QApplication, QWidget
 
 from ballontranslator.ui import shared_widget as SW
@@ -32,6 +35,8 @@ class KoreanBalloonLayoutTest(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
+        self.font_family = '맑은 고딕' if sys.platform == 'win32' else 'DejaVu Sans'
+        self.center = (150, 150)
         self.image = np.full((300, 300, 3), 255, np.uint8)
         cv2.ellipse(self.image, (150, 150), (90, 120), 0, 0, 360, (0, 0, 0), 3)
         Image.fromarray(self.image).save(os.path.join(self.directory.name, 'page.png'))
@@ -67,29 +72,57 @@ class KoreanBalloonLayoutTest(unittest.TestCase):
         self.app.processEvents()
 
     def _add_dialogue(self, text, *, alignment=None, angle=0, small_source=False, font_size=None):
-        lines = np.array([[[135, 135], [165, 135], [165, 165], [135, 165]]]) if small_source else np.array([[[135, 85], [165, 85], [165, 215], [135, 215]]])
-        block = group_output([], lines, 300, 300, np.full((300, 300), 255, np.uint8))[0]
+        cx, cy = self.center
+        half_height = 15 if small_source else 65
+        lines = np.array([[[cx - 15, cy - half_height], [cx + 15, cy - half_height], [cx + 15, cy + half_height], [cx - 15, cy + half_height]]])
+        height, width = self.project.img_array.shape[:2]
+        block = group_output([], lines, width, height, np.full((height, width), 255, np.uint8))[0]
         MainWindow.postprocess_translations(None, [block])
         if alignment is not None:
             block.alignment = alignment
         block.angle = angle
         if font_size is not None:
             block.font_size = font_size
-        block.font_family = 'DejaVu Sans'
+        block.font_family = self.font_family
         block.translation = text
         self.project.pages['page.png'] = [block]
         return self.manager.addTextBlock(block)
 
     def test_long_dialogue_fits_both_width_and_height_without_losing_text(self):
         source = '한국어 대사를 길게 번역해도 말풍선 안에 자연스럽게 들어가야 합니다. 글자가 넘치지 않도록 확인합니다.'
+        # Success needs a genuinely large enough balloon for the platform's
+        # chosen font. Measure that premise with ordinary Qt document layout,
+        # independently of our fitter; DejaVu fallback differs on Windows.
+        font = QFont(self.font_family)
+        font.setPointSizeF(30 * 72 / shared.LDPI * .6)
+        font.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 115)
+        metrics = QFontMetricsF(font)
+        reference = QTextDocument()
+        reference.setDefaultFont(font)
+        reference.setDocumentMargin(0)
+        reference.setPlainText(source)
+        reference.setTextWidth(math.ceil(metrics.horizontalAdvance('한국어 대사를 길게')))
+        cursor = QTextCursor(reference)
+        cursor.select(QTextCursor.SelectionType.Document)
+        block_format = QTextBlockFormat()
+        proportional = QTextBlockFormat.LineHeightTypes.ProportionalHeight
+        block_format.setLineHeight(120, int(getattr(proportional, 'value', proportional)))
+        cursor.mergeBlockFormat(block_format)
+        needed = reference.size()
+        axes = (math.ceil(needed.width() * .85 + 8), max(85, math.ceil(needed.height() * .85 + 8)))
+        self.center = (axes[0] + 24, axes[1] + 24)
+        image = np.full((self.center[1] * 2, self.center[0] * 2, 3), 255, np.uint8)
+        cv2.ellipse(image, self.center, axes, 0, 0, 360, (0, 0, 0), 3)
+        self.project.img_array = image
+        balloon = QRectF(24, 24, axes[0] * 2, axes[1] * 2)
         item = self._add_dialogue(source)
-        rect = item.visual_bounds_in_scene()
-        self.assertGreaterEqual(rect.top(), 33)
-        self.assertLessEqual(rect.bottom(), 267)
-        self.assertGreaterEqual(rect.left(), 63)
-        self.assertLessEqual(rect.right(), 237)
+        diagnostic = f'font={QFontInfo(item.font()).family()!r}, size={item.font().pointSizeF()}, reference={needed.width()}x{needed.height()}, balloon={balloon}'
+        rect = item.mapRectToParent(item.boundingRect())
+        self.assertTrue(balloon.contains(rect), diagnostic)
         self.assertEqual(''.join(item.toPlainText().split()), ''.join(source.split()))
-        self.assertTrue(self.manager.korean_layout_fits(item))
+        self.assertEqual(self.manager.auto_layout_failed, [], diagnostic)
+        self.assertTrue(self.manager.korean_layout_fits(item), diagnostic)
+        self.assertLessEqual(item.font().pointSizeF(), 30 * 72 / shared.LDPI)
 
     def test_short_dialogue_stays_centered_and_readable(self):
         item = self._add_dialogue('너 지금 뭐 하는 거야?')
