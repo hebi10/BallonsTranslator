@@ -1,4 +1,4 @@
-name: Final reader UI verification
+name: Reader export contrast and delivery
 on:
   push:
     branches: ['codex/local-reader-export']
@@ -27,22 +27,6 @@ jobs:
         with:
           python-version: '3.12'
           cache: pip
-      - name: Apply exact previously tested UI corrections
-        shell: python
-        run: |
-          import pathlib, subprocess, json
-          updates = json.loads(pathlib.Path('.github/reader-ui-fix.json').read_text(encoding='utf-8'))
-          for item in updates:
-              name, expected, edits = item[:3]
-              assert name in ('ballontranslator/ui/result_reader.py', 'ballontranslator/ui/image_merge_dialog.py', 'tests/test_result_reader_ui.py')
-              assert subprocess.check_output(['git','rev-parse','HEAD:'+name],text=True).strip() == expected, name
-              text = subprocess.check_output(['git','show','HEAD:'+name]).decode('utf-8')
-              for old,new in edits:
-                  assert text.count(old) == 1, name
-                  text = text.replace(old,new,1)
-              if len(item) == 4:
-                  text += item[3]
-              pathlib.Path(name).write_bytes(text.encode('utf-8'))
       - name: Install existing test dependencies
         run: python -m pip install -r requirements.txt pytest "openai>=2.8.1" "PyQt5==5.15.11"
       - name: Prepare Korean font for offscreen verification only
@@ -51,6 +35,76 @@ jobs:
           $FontPath = Join-Path $env:RUNNER_TEMP 'NotoSansCJKkr-Regular.otf'
           Invoke-WebRequest -UseBasicParsing -Uri 'https://raw.githubusercontent.com/notofonts/noto-cjk/main/Sans/OTF/Korean/NotoSansCJKkr-Regular.otf' -OutFile $FontPath
           "READER_TEST_FONT=$FontPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Prove settings contrast regression before correction
+        shell: python
+        run: |
+          import pathlib, subprocess, sys, textwrap, xml.etree.ElementTree as ET
+          changed = subprocess.check_output(['git','diff','--name-only','26bea7bca868efe13961d767f74eeaae9dbd4bd1','HEAD','--','ballontranslator','scripts','tests','doc','docs'],text=True).strip()
+          assert not changed, changed
+          path = pathlib.Path('tests/test_result_reader_ui.py')
+          test = textwrap.dedent('''
+          def test_workspace_export_settings_have_visible_text_contrast(app, book, tmp_path):
+              from collections import Counter
+              from qtpy.QtCore import QPoint
+              from qtpy.QtGui import QColor, QPalette
+              from ballontranslator.ui.local_workspace import LocalWorkspace
+              owner = LocalWorkspace(queue_path=tmp_path / 'jobs.json')
+              owner.show()
+              app.processEvents()
+              dialog = ImageMergeDialog(book, owner)
+              try:
+                  dialog.resize(800, 620)
+                  dialog.show()
+                  until(app, lambda: dialog.preview_ready)
+                  picture = dialog.grab()
+                  image = picture.toImage()
+                  root = Path(os.environ.get('READER_SCREENSHOT_DIR', str(tmp_path)))
+                  root.mkdir(parents=True, exist_ok=True)
+                  assert picture.save(str(root / 'image-export-contrast.png'))
+                  label = dialog.cross_label
+                  origin = label.mapTo(dialog, QPoint(0, 0))
+                  scale = picture.devicePixelRatio()
+                  area = image.copy(round(origin.x() * scale), round(origin.y() * scale),
+                                    round(label.width() * scale), round(label.height() * scale))
+                  pixels = Counter(area.pixel(x, y) & 0xFFFFFF
+                                   for x in range(area.width()) for y in range(area.height()))
+                  background = QColor(pixels.most_common(1)[0][0])
+                  foreground = label.palette().color(QPalette.ColorRole.WindowText)
+                  def luminance(color):
+                      channels = [color.redF(), color.greenF(), color.blueF()]
+                      linear = [v / 12.92 if v <= 0.04045 else ((v + 0.055) / 1.055) ** 2.4 for v in channels]
+                      return sum(v * weight for v, weight in zip(linear, (0.2126, 0.7152, 0.0722)))
+                  light, dark = sorted((luminance(background), luminance(foreground)), reverse=True)
+                  contrast = (light + 0.05) / (dark + 0.05)
+                  assert contrast >= 4.5, ('settings contrast', contrast, background.name(), foreground.name())
+              finally:
+                  close_merge(app, dialog)
+                  owner.close()
+                  owner.deleteLater()
+                  app.processEvents()
+                  QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+          ''')
+          path.write_bytes((path.read_text(encoding='utf-8')+'\n\n'+test).encode('utf-8'))
+          result = subprocess.run([sys.executable,'-m','pytest',str(path)+'::test_workspace_export_settings_have_visible_text_contrast','-q','--junitxml=reader-verification/contrast-red.xml'])
+          assert result.returncode == 1, 'Expected an assertion failure before the fix'
+          failures = ET.parse('reader-verification/contrast-red.xml').findall('.//failure')
+          assert len(failures)==1 and 'settings contrast' in ''.join(failures[0].itertext()), 'The regression did not fail for contrast'
+      - name: Correct only the export scroll surface background
+        shell: python
+        run: |
+          import pathlib
+          path = pathlib.Path('ballontranslator/ui/result_reader.py')
+          text = path.read_text(encoding='utf-8')
+          old = "                  f'{scope} QGroupBox, {scope} QCheckBox {{ color: #ededed; }}')"
+          new = "                  f'{scope} QGroupBox, {scope} QCheckBox {{ color: #ededed; }}'\n                  f'{scope} QWidget#ReaderExportSurface, {scope} QWidget#ReaderExportSurface QGroupBox '\n                  '{{ background: #191919; }}')"
+          assert text.count(old)==1
+          path.write_bytes(text.replace(old,new,1).encode('utf-8'))
+          path = pathlib.Path('ballontranslator/ui/image_merge_dialog.py')
+          text = path.read_text(encoding='utf-8')
+          old = '        right = QWidget(); right_layout = QVBoxLayout(right); right_layout.setContentsMargins(0, 0, 0, 0)\n'
+          new = '        right = QWidget()\n        right.setObjectName("ReaderExportSurface")\n        right.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)\n        right_layout = QVBoxLayout(right); right_layout.setContentsMargins(0, 0, 0, 0)\n'
+          assert text.count(old)==1
+          path.write_bytes(text.replace(old,new,1).encode('utf-8'))
       - name: Compile and verify reader plus UI tests
         run: |
           python -m compileall -q ballontranslator scripts tests
@@ -72,24 +126,22 @@ jobs:
           ./scripts/test_local_windows.ps1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -m unittest discover -s scripts/tests -v
-      - name: Commit verified application files without workflow changes
+      - name: Commit verified application correction without workflow changes
         shell: python
         run: |
           import pathlib, subprocess
           plan = pathlib.Path('docs/superpowers/plans/2026-10-16-reader-export.md')
-          text = plan.read_text(encoding='utf-8').replace('- [ ]', '- [x]')
-          text = text.replace('deliver verified source/bootstrap package', 'deliver verified change-only update ZIP and patch')
-          text += '\n- Windows verification: 43 new tests pass with Qt6 and Qt5 separately; all 32 local regression files pass; seven original Qt5 regression files pass. Windows launcher and packaging tests pass with the existing symlink privilege skip.\n- Offscreen screenshots use a Korean font loaded only in the CI temporary directory. No font files are distributed. Compact export settings scroll rather than overlap; workspace-owned dialogs preserve dark contrast.\n- Resume ruling: commit application files separately from CI configuration. The prior run passed tests but could not push workflow changes with its runtime token; no token permission expansion is requested.\n- GPU inference, user PC installation and phone gallery compatibility were not exercised.\n'
+          text = plan.read_text(encoding='utf-8')
+          text += '\n- Final review: self-review of worker lifecycle, export rollback, file boundaries and screenshots; no independent reviewer was available. Screenshot review found dark-workspace export labels on an unstyled light scroll surface. A rendered-pixel contrast test failed before the scoped surface correction and passed afterward.\n- Final correction verification: 44 reader/export tests pass separately on Qt6 and Qt5; all 32 local regression files and seven original Qt5 regression files pass. Packaging/launcher checks pass (one existing Windows symlink privilege skip).\n- Local non-Qt verification: 38 reader/export and packaging tests passed. GUI dependencies could not be installed in the review container; Windows CI supplied the Qt verification. Actual GPU translation, user PC installation and phone gallery compatibility remain untested.\n'
           plan.write_bytes(text.encode('utf-8'))
           paths = ['ballontranslator/ui/result_reader.py','ballontranslator/ui/image_merge_dialog.py','tests/test_result_reader_ui.py',str(plan).replace('\\','/')]
           subprocess.run(['git','add','-f','--',*paths],check=True)
-          subprocess.run(['git','rm','--','.github/reader-ui-fix.json'],check=True)
           changed = subprocess.check_output(['git','diff','--cached','--name-only'],text=True).splitlines()
           assert not any(p.startswith('.github/workflows/') for p in changed), changed
           subprocess.run(['git','diff','--cached','--check'],check=True)
           subprocess.run(['git','config','user.name','github-actions[bot]'],check=True)
           subprocess.run(['git','config','user.email','41898282+github-actions[bot]@users.noreply.github.com'],check=True)
-          subprocess.run(['git','commit','-m','Fix compact export layout and verify Korean reader UI on Qt5 and Qt6'],check=True)
+          subprocess.run(['git','commit','-m','Keep dark export settings legible with rendered contrast regression'],check=True)
           subprocess.run(['git','push','origin','HEAD:refs/heads/codex/local-reader-export'],check=True)
           revision = subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
           pathlib.Path('reader-verification/verified-revision.txt').write_text(revision+'\n',encoding='utf-8')
