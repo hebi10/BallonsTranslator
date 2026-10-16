@@ -17,6 +17,7 @@ from qtpy.QtWidgets import (
 from ballontranslator.utils import shared
 from ballontranslator.utils.config import pcfg, save_config
 from ballontranslator.utils.logger import logger as LOGGER
+from ballontranslator.utils.local_edition import LOCAL_SOURCE_OCR, apply_local_profile
 
 
 STATES = {
@@ -88,6 +89,8 @@ class LocalJobQueue:
                 'restart': row.get('restart') is True,
                 'resave': row.get('resave') is True or row.get('state') == 'running',
                 'review_pages': valid_review_pages,
+                'source_language': row.get('source_language', '日本語')
+                if row.get('source_language', '日本語') in LOCAL_SOURCE_OCR else '日本語',
             })
         if invalid:
             self.warning = f'작업 목록에서 잘못된 항목 {invalid}개를 제외했습니다.'
@@ -117,7 +120,9 @@ class LocalJobQueue:
             if os.path.exists(temporary):
                 os.unlink(temporary)
 
-    def add(self, folders: list[str]) -> None:
+    def add(self, folders: list[str], source_language: str = '日本語') -> None:
+        if source_language not in LOCAL_SOURCE_OCR:
+            raise ValueError('지원하지 않는 원문 언어입니다.')
         if not self.writable:
             raise ValueError(self.warning)
         seen = {os.path.normcase(job['folder']) for job in self.jobs}
@@ -127,7 +132,8 @@ class LocalJobQueue:
                 continue
             key = os.path.normcase(str(path))
             if key not in seen:
-                self.jobs.append({'folder': str(path), 'state': 'pending', 'done': 0, 'total': 0, 'error': ''})
+                self.jobs.append({'folder': str(path), 'state': 'pending', 'done': 0, 'total': 0,
+                                  'error': '', 'source_language': source_language})
                 seen.add(key)
         self.save()
 
@@ -143,9 +149,10 @@ class LocalSetupThread(QThread):
     completed = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, operation: str, parent=None) -> None:
+    def __init__(self, operation: str, parent=None, source_language: str = '日本語') -> None:
         super().__init__(parent)
         self.operation = operation
+        self.source_language = source_language
         self.stop_event = threading.Event()
 
     def run(self) -> None:
@@ -155,7 +162,7 @@ class LocalSetupThread(QThread):
             client = OllamaClient()
             result = None
             if self.operation == 'status':
-                checks = local_readiness()
+                checks = local_readiness(self.source_language)
                 try:
                     status = client.status()
                     checks.append(('Ollama 실행', True, f"버전 {status.get('version', '')}"))
@@ -164,11 +171,11 @@ class LocalSetupThread(QThread):
                     checks.append(('Ollama 실행', False, f'launch_local.bat로 실행하세요. {exc}'))
                 result = checks
             elif self.operation == 'prepare':
-                prepare_local_models(self.progress.emit, self.stop_event)
+                prepare_local_models(self.progress.emit, self.stop_event, self.source_language)
             elif self.operation == 'pull':
                 client.pull(self.progress.emit, self.stop_event)
             elif self.operation == 'test':
-                result = client.test_translation(stop_event=self.stop_event)
+                result = client.test_translation(stop_event=self.stop_event, source_language=self.source_language)
             else:
                 raise ValueError('알 수 없는 준비 작업입니다.')
             if self.stop_event.is_set():
@@ -218,9 +225,21 @@ class LocalWorkspace(QDialog):
         font.setBold(True)
         title.setFont(font)
         outer.addWidget(title)
-        subtitle = QLabel('일본어 → 한국어  ·  CTD / manga_ocr / Qwen3.5 9B / LaMa', self)
-        subtitle.setWordWrap(True)
-        outer.addWidget(subtitle)
+        self.subtitle = QLabel(self)
+        self.subtitle.setWordWrap(True)
+        outer.addWidget(self.subtitle)
+        source_row = QHBoxLayout()
+        source_row.addWidget(QLabel('원문 언어 · 새로 추가하는 폴더에 적용', self))
+        self.source_combo = QComboBox(self)
+        self.source_combo.addItem('일본어', '日本語')
+        self.source_combo.addItem('영어', 'English')
+        selected = self.source_combo.findData(pcfg.module.translate_source)
+        self.source_combo.setCurrentIndex(selected if selected >= 0 else 0)
+        self.source_combo.currentIndexChanged.connect(self.on_source_changed)
+        source_row.addWidget(self.source_combo)
+        source_row.addStretch(1)
+        outer.addLayout(source_row)
+        self._update_source_description()
         setup = QFrame(self)
         setup.setObjectName('LocalSetupSurface')
         setup_layout = QVBoxLayout(setup)
@@ -252,14 +271,15 @@ class LocalWorkspace(QDialog):
         setup_layout.addWidget(hint)
         outer.addWidget(setup)
         outer.addWidget(QLabel('2  번역 폴더 · 여러 폴더를 이 창에 끌어 놓을 수 있습니다.', self))
-        self.table = QTableWidget(0, 3, self)
-        self.table.setHorizontalHeaderLabels(['이미지 폴더', '진행', '상태'])
+        self.table = QTableWidget(0, 4, self)
+        self.table.setHorizontalHeaderLabels(['이미지 폴더', '원문', '진행', '상태'])
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.verticalHeader().hide()
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         outer.addWidget(self.table, 1)
         folder_buttons = QHBoxLayout()
         self.add_button = QPushButton('폴더 추가', self)
@@ -347,12 +367,57 @@ class LocalWorkspace(QDialog):
         for button in self.setup_buttons:
             button.setEnabled(idle)
         self.visual_context_checkbox.setEnabled(idle)
+        self.source_combo.setEnabled(idle)
         for widget in (self.add_button, self.remove_button, self.edit_button, self.output_edit,
                        self.output_button, self.format_combo, self.start_button, self.retry_button, self.restart_button):
             widget.setEnabled(idle and self.queue.writable)
         self.pause_button.setEnabled(self.running and not self.pause_pending)
         self.cancel_button.setEnabled(self.worker is not None and self._last_operation != 'status')
         self.close_button.setEnabled(idle)
+
+    def _update_source_description(self) -> None:
+        lang = self.source_combo.currentData()
+        display = '영어 · MIT 48px' if lang == 'English' else '일본어 · manga_ocr'
+        self.subtitle.setText(f'{display} → 한국어  ·  CTD / Qwen3.5 9B / LaMa')
+
+    def _activate_source(self, source_language: str) -> bool:
+        if source_language not in LOCAL_SOURCE_OCR:
+            self.status_label.setText('지원하지 않는 원문 언어입니다.')
+            return False
+        previous = pcfg.module.translate_source
+        if source_language != previous or pcfg.module.ocr != LOCAL_SOURCE_OCR[source_language]:
+            pcfg.module.translate_source = source_language
+            apply_local_profile(pcfg)
+            try:
+                result = save_config()
+                if result is False:
+                    raise OSError('설정 파일을 저장하지 못했습니다.')
+            except OSError as exc:
+                pcfg.module.translate_source = previous
+                apply_local_profile(pcfg)
+                self.status_label.setText(f'원문 언어 설정 저장 실패: {exc}')
+                index = self.source_combo.findData(previous)
+                self.source_combo.blockSignals(True)
+                self.source_combo.setCurrentIndex(max(0, index))
+                self.source_combo.blockSignals(False)
+                self._update_source_description()
+                return False
+        index = self.source_combo.findData(source_language)
+        self.source_combo.blockSignals(True)
+        self.source_combo.setCurrentIndex(index)
+        self.source_combo.blockSignals(False)
+        self._update_source_description()
+        self.checks.setRowCount(0)
+        return True
+
+    def on_source_changed(self, _index: int) -> None:
+        if self.busy:
+            return
+        if self._activate_source(self.source_combo.currentData()):
+            self.status_label.setText(
+                '원문 언어가 선택되었습니다. 해당 OCR 준비 상태를 다시 확인하세요. '
+                '기존 폴더의 저장된 원문 언어는 변경되지 않습니다.'
+            )
 
     def on_setup_clicked(self) -> None:
         self.start_setup(self.sender().property('operation'))
@@ -363,7 +428,7 @@ class LocalWorkspace(QDialog):
         self._last_operation = operation
         self._worker_error = ''
         self._worker_result = None
-        self.worker = LocalSetupThread(operation, self)
+        self.worker = LocalSetupThread(operation, self, source_language=self.source_combo.currentData())
         self.worker.progress.connect(self.status_label.setText)
         self.worker.completed.connect(self.on_setup_result)
         self.worker.failed.connect(self.on_setup_error)
@@ -430,7 +495,7 @@ class LocalWorkspace(QDialog):
         if self.busy:
             return
         try:
-            self.queue.add(folders)
+            self.queue.add(folders, source_language=self.source_combo.currentData())
             self.refresh_queue()
         except (ValueError, OSError) as exc:
             self.status_label.setText(str(exc))
@@ -455,7 +520,9 @@ class LocalWorkspace(QDialog):
         selected = self.table.currentRow()
         self.table.setRowCount(len(self.queue.jobs))
         for row, job in enumerate(self.queue.jobs):
-            values = [job['folder'], f"{job['done']} / {job['total']}" if job['total'] else '—', STATES[job['state']]]
+            language = '영어' if job.get('source_language') == 'English' else '일본어'
+            values = [job['folder'], language,
+                      f"{job['done']} / {job['total']}" if job['total'] else '—', STATES[job['state']]]
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 item.setToolTip(job['error'] or job['folder'])
@@ -547,6 +614,11 @@ class LocalWorkspace(QDialog):
             self.set_controls()
             return
         job = self.queue.jobs[self.active_index]
+        if not self._activate_source(job.get('source_language', '日本語')):
+            self.active_index = None
+            self.running = False
+            self.set_controls()
+            return
         job['state'] = 'running'
         job['error'] = ''
         if not self.save_queue():
@@ -569,7 +641,7 @@ class LocalWorkspace(QDialog):
         self.progress.setValue(done)
         self.status_label.setText(detail)
         if changed:
-            self.table.item(self.active_index, 1).setText(f'{done} / {total}')
+            self.table.item(self.active_index, 2).setText(f'{done} / {total}')
 
     def finish_job(self, success: bool, error: str, done: int, total: int) -> None:
         if self.active_index is None:
@@ -603,8 +675,10 @@ class LocalWorkspace(QDialog):
     def edit_selected(self) -> None:
         row = self.table.currentRow()
         if not self.busy and 0 <= row < len(self.queue.jobs):
-            self.edit_requested.emit(self.queue.jobs[row]['folder'])
-            self.hide()
+            job = self.queue.jobs[row]
+            if self._activate_source(job.get('source_language', '日本語')):
+                self.edit_requested.emit(job['folder'])
+                self.hide()
 
     def open_result(self) -> None:
         row = self.table.currentRow()
