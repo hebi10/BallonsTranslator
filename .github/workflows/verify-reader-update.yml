@@ -21,11 +21,13 @@ jobs:
       READER_SCREENSHOT_DIR: reader-verification/qt6
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
           cache: pip
-      - name: Apply exact UI corrections and permanent CI coverage
+      - name: Apply exact previously tested UI corrections
         shell: python
         run: |
           import pathlib, subprocess, json
@@ -41,34 +43,6 @@ jobs:
               if len(item) == 4:
                   text += item[3]
               pathlib.Path(name).write_bytes(text.encode('utf-8'))
-          name = '.github/workflows/local-windows.yml'
-          assert subprocess.check_output(['git','rev-parse','HEAD:'+name],text=True).strip() == '58165b9e6128813e984c45e1cfff31a0d6746888'
-          text = subprocess.check_output(['git','show','HEAD:'+name]).decode('utf-8')
-          text = text.replace("      TRANSFORMERS_OFFLINE: '1'\n", "      TRANSFORMERS_OFFLINE: '1'\n      READER_SCREENSHOT_DIR: reader-screenshots/qt6\n")
-          font_step = '\n'.join([
-              '      - name: Prepare Korean font for UI verification only',
-              '        shell: powershell',
-              '        run: |',
-              "          $FontPath = Join-Path $env:RUNNER_TEMP 'NotoSansCJKkr-Regular.otf'",
-              "          Invoke-WebRequest -UseBasicParsing -Uri 'https://raw.githubusercontent.com/notofonts/noto-cjk/main/Sans/OTF/Korean/NotoSansCJKkr-Regular.otf' -OutFile $FontPath",
-              '          "READER_TEST_FONT=$FontPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append',
-              '',
-          ])
-          text = text.replace('      - name: Parse and test Windows launch scripts\n', font_step + '      - name: Parse and test Windows launch scripts\n')
-          text = text.replace('          QT_API: pyqt5\n', '          QT_API: pyqt5\n          READER_SCREENSHOT_DIR: reader-screenshots/qt5\n')
-          text = text.replace('--files tests/test_korean_segmentation.py', '--files tests/test_result_reader_ui.py tests/test_korean_segmentation.py')
-          upload = '\n'.join([
-              '      - name: Upload reader UI verification images',
-              '        if: always()',
-              '        uses: actions/upload-artifact@v4',
-              '        with:',
-              '          name: reader-ui-verification',
-              '          path: reader-screenshots/',
-              '          if-no-files-found: ignore',
-              '',
-          ])
-          text = text.replace('      - name: Build source and bootstrap package\n', upload + '      - name: Build source and bootstrap package\n')
-          pathlib.Path(name).write_bytes(text.encode('utf-8'))
       - name: Install existing test dependencies
         run: python -m pip install -r requirements.txt pytest "openai>=2.8.1" "PyQt5==5.15.11"
       - name: Prepare Korean font for offscreen verification only
@@ -98,18 +72,20 @@ jobs:
           ./scripts/test_local_windows.ps1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -m unittest discover -s scripts/tests -v
-      - name: Commit verified correction and remove temporary transfer files
+      - name: Commit verified application files without workflow changes
         shell: python
         run: |
-          import pathlib, subprocess, json
+          import pathlib, subprocess
           plan = pathlib.Path('docs/superpowers/plans/2026-10-16-reader-export.md')
           text = plan.read_text(encoding='utf-8').replace('- [ ]', '- [x]')
           text = text.replace('deliver verified source/bootstrap package', 'deliver verified change-only update ZIP and patch')
-          text += '\n- Final Windows verification: 43 new tests pass with Qt6 and Qt5 separately; all 32 local regression files pass; seven original Qt5 regression files pass. Windows launcher and packaging tests pass with the existing symlink privilege skip.\n- Offscreen screenshots use a Korean font loaded only in the CI temporary directory. No font files are distributed. Compact export settings scroll rather than overlap; workspace-owned dialogs preserve dark contrast.\n- GPU inference, user PC installation and phone gallery compatibility were not exercised.\n'
+          text += '\n- Windows verification: 43 new tests pass with Qt6 and Qt5 separately; all 32 local regression files pass; seven original Qt5 regression files pass. Windows launcher and packaging tests pass with the existing symlink privilege skip.\n- Offscreen screenshots use a Korean font loaded only in the CI temporary directory. No font files are distributed. Compact export settings scroll rather than overlap; workspace-owned dialogs preserve dark contrast.\n- Resume ruling: commit application files separately from CI configuration. The prior run passed tests but could not push workflow changes with its runtime token; no token permission expansion is requested.\n- GPU inference, user PC installation and phone gallery compatibility were not exercised.\n'
           plan.write_bytes(text.encode('utf-8'))
-          paths = ['ballontranslator/ui/result_reader.py','ballontranslator/ui/image_merge_dialog.py','tests/test_result_reader_ui.py','.github/workflows/local-windows.yml',str(plan).replace('\\','/')]
+          paths = ['ballontranslator/ui/result_reader.py','ballontranslator/ui/image_merge_dialog.py','tests/test_result_reader_ui.py',str(plan).replace('\\','/')]
           subprocess.run(['git','add','-f','--',*paths],check=True)
-          subprocess.run(['git','rm','--','.github/reader-ui-fix.json','.github/workflows/verify-reader-update.yml'],check=True)
+          subprocess.run(['git','rm','--','.github/reader-ui-fix.json'],check=True)
+          changed = subprocess.check_output(['git','diff','--cached','--name-only'],text=True).splitlines()
+          assert not any(p.startswith('.github/workflows/') for p in changed), changed
           subprocess.run(['git','diff','--cached','--check'],check=True)
           subprocess.run(['git','config','user.name','github-actions[bot]'],check=True)
           subprocess.run(['git','config','user.email','41898282+github-actions[bot]@users.noreply.github.com'],check=True)
@@ -117,6 +93,36 @@ jobs:
           subprocess.run(['git','push','origin','HEAD:refs/heads/codex/local-reader-export'],check=True)
           revision = subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
           pathlib.Path('reader-verification/verified-revision.txt').write_text(revision+'\n',encoding='utf-8')
+      - name: Package exact change-only sources and patch
+        shell: python
+        run: |
+          import hashlib, json, pathlib, subprocess, zipfile
+          base = '30d89434d021ca2873b97c7ab5614ed5cee87495'
+          head = subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
+          names = subprocess.check_output(['git','diff','--name-only','--diff-filter=AM',base,head],text=True).splitlines()
+          names = [n for n in names if not n.startswith('.github/')]
+          assert names and all(n.startswith(('ballontranslator/','scripts/','tests/','doc/','docs/')) for n in names), names
+          manifest = {'base_commit':base,'source_commit':head,'files':[]}
+          package = pathlib.Path('reader-delivery'); package.mkdir()
+          with zipfile.ZipFile(package/'BallonsTranslator-Reader-Update.zip','w',zipfile.ZIP_DEFLATED) as archive:
+              for name in names:
+                  assert pathlib.PurePosixPath(name).suffix.lower() not in ('.ttf','.otf','.woff','.woff2','.ttc')
+                  data = subprocess.check_output(['git','show',head+':'+name])
+                  old = subprocess.run(['git','show',base+':'+name],capture_output=True)
+                  manifest['files'].append({'path':name,'sha256':hashlib.sha256(data).hexdigest(),'base_sha256':hashlib.sha256(old.stdout).hexdigest() if old.returncode==0 else None})
+                  archive.writestr(name,data)
+              archive.writestr('LICENSE',subprocess.check_output(['git','show',head+':LICENSE']))
+              archive.writestr('UPDATE_MANIFEST.json',json.dumps(manifest,ensure_ascii=False,indent=2)+'\n')
+          patch = subprocess.check_output(['git','diff','--binary',base,head,'--',*names])
+          (package/'reader-export.patch').write_bytes(patch)
+          (package/'UPDATE_MANIFEST.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
+      - name: Upload verified update sources
+        uses: actions/upload-artifact@v4
+        with:
+          name: reader-verified-update
+          path: reader-delivery/
+          if-no-files-found: error
+          retention-days: 30
       - name: Upload screenshots and verification reports only
         if: always()
         uses: actions/upload-artifact@v4
