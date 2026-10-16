@@ -38,3 +38,7 @@ Corrupt project/history files remain unchanged. Missing/duplicate pages cannot s
 - Offscreen screenshots use a Korean font loaded only in the CI temporary directory. No font files are distributed. Compact export settings scroll rather than overlap; workspace-owned dialogs preserve dark contrast.
 - Resume ruling: commit application files separately from CI configuration. The prior run passed tests but could not push workflow changes with its runtime token; no token permission expansion is requested.
 - GPU inference, user PC installation and phone gallery compatibility were not exercised.
+
+- Final review: self-review of worker lifecycle, export rollback, file boundaries and screenshots; no independent reviewer was available. Screenshot review found dark-workspace export labels on an unstyled light scroll surface. A rendered-pixel contrast test failed before the scoped surface correction and passed afterward.
+- Final correction verification: 44 reader/export tests pass separately on Qt6 and Qt5; all 32 local regression files and seven original Qt5 regression files pass. Packaging/launcher checks pass (one existing Windows symlink privilege skip).
+- Local non-Qt verification: 38 reader/export and packaging tests passed. GUI dependencies could not be installed in the review container; Windows CI supplied the Qt verification. Actual GPU translation, user PC installation and phone gallery compatibility remain untested.

@@ -231,3 +231,46 @@ def test_workspace_owned_reader_and_small_export_are_readable(app, book, tmp_pat
         close_merge(app, merge)
         owner.close(); owner.deleteLater(); app.processEvents()
         QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+
+
+def test_workspace_export_settings_have_visible_text_contrast(app, book, tmp_path):
+    from collections import Counter
+    from qtpy.QtCore import QPoint
+    from qtpy.QtGui import QColor, QPalette
+    from ballontranslator.ui.local_workspace import LocalWorkspace
+    owner = LocalWorkspace(queue_path=tmp_path / 'jobs.json')
+    owner.show()
+    app.processEvents()
+    dialog = ImageMergeDialog(book, owner)
+    try:
+        dialog.resize(800, 620)
+        dialog.show()
+        until(app, lambda: dialog.preview_ready)
+        picture = dialog.grab()
+        image = picture.toImage()
+        root = Path(os.environ.get('READER_SCREENSHOT_DIR', str(tmp_path)))
+        root.mkdir(parents=True, exist_ok=True)
+        assert picture.save(str(root / 'image-export-contrast.png'))
+        label = dialog.cross_label
+        origin = label.mapTo(dialog, QPoint(0, 0))
+        scale = picture.devicePixelRatio()
+        area = image.copy(round(origin.x() * scale), round(origin.y() * scale),
+                          round(label.width() * scale), round(label.height() * scale))
+        pixels = Counter(area.pixel(x, y) & 0xFFFFFF
+                         for x in range(area.width()) for y in range(area.height()))
+        background = QColor(pixels.most_common(1)[0][0])
+        foreground = label.palette().color(QPalette.ColorRole.WindowText)
+        def luminance(color):
+            channels = [color.redF(), color.greenF(), color.blueF()]
+            linear = [v / 12.92 if v <= 0.04045 else ((v + 0.055) / 1.055) ** 2.4 for v in channels]
+            return sum(v * weight for v, weight in zip(linear, (0.2126, 0.7152, 0.0722)))
+        light, dark = sorted((luminance(background), luminance(foreground)), reverse=True)
+        contrast = (light + 0.05) / (dark + 0.05)
+        assert contrast >= 4.5, ('settings contrast', contrast, background.name(), foreground.name())
+    finally:
+        close_merge(app, dialog)
+        owner.close()
+        owner.deleteLater()
+        app.processEvents()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)

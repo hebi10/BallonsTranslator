@@ -42,7 +42,9 @@ def size_dialog(dialog: QDialog, width: int, height: int) -> None:
         style = owner.styleSheet().replace('LocalWorkspace', dialog.objectName())
         style += (f'{scope} QListWidget, {scope} QSpinBox {{ background: #242424; color: #ededed; '
                   'border: 1px solid #555555; selection-background-color: #505050; }'
-                  f'{scope} QGroupBox, {scope} QCheckBox {{ color: #ededed; }}')
+                  f'{scope} QGroupBox, {scope} QCheckBox {{ color: #ededed; }}'
+                  f'{scope} QWidget#ReaderExportSurface, {scope} QWidget#ReaderExportSurface QGroupBox '
+                  '{ background: #191919; }')
         dialog.setStyleSheet(style)
     screen = QApplication.primaryScreen()
     available = screen.availableGeometry() if screen else QRect(0, 0, width + 32, height + 32)
