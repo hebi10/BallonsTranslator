@@ -26,8 +26,8 @@ try {
         Write-Host 'Installing Python packages. Existing models and settings are preserved.'
         $GetPip = Join-Path $BuildDir 'get-pip.py'
         Invoke-WebRequest -UseBasicParsing -Uri 'https://bootstrap.pypa.io/get-pip.py' -OutFile $GetPip
-        Invoke-CheckedNative $PythonExe @($GetPip, '--no-warn-script-location')
-        Invoke-CheckedNative $PythonExe @('-m', 'pip', 'install', '--disable-pip-version-check', '--no-warn-script-location', '-r', (Join-Path $ProjectRoot 'requirements-local.txt'))
+        Initialize-EmbeddedPythonPackaging -PythonExe $PythonExe -GetPipScript $GetPip
+        Install-EmbeddedPythonRequirements -PythonExe $PythonExe -RequirementsFile (Join-Path $ProjectRoot 'requirements-local.txt')
         $ProfileScript = Join-Path $BuildDir 'torch_profile.py'
         $ProfileSource = @'
 import json

@@ -18,6 +18,12 @@ Windows 10 22H2 이상, 64비트 x86 PC를 대상으로 합니다. Ollama의 GPU
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\install_local.ps1 -InstallOllama
 ```
 
+## 최초 설치 오류 복구
+
+Python 패키지 설치 중 `BackendUnavailable: Cannot import 'setuptools.build_meta'`가 발생하면 Windows 임베디드 Python이 별도의 pip 빌드 환경을 찾지 못한 경우일 수 있습니다. 수정된 실행기는 전용 Python 환경에 `setuptools`·`wheel`을 설치하고, Python 패키지 설치 시 빌드 격리를 비활성화합니다.
+
+이미 설치에 실패했다면 수정된 소스의 `scripts/install_local.ps1` 및 `scripts/local_windows_helpers.ps1`을 적용한 뒤 `launch_local.bat`을 다시 실행하십시오. 완료 표식(`.ready`)이 생성되지 않은 환경에서는 패키지 설치를 다시 시도합니다. 기존 모델과 설정, 작업 이미지는 삭제하지 않습니다. 설치 완료 후 실제 번역이 정상 작동하는지는 별도 확인이 필요합니다.
+
 ## 저장 위치와 로컬 처리
 
 - Python 실행 환경: 프로그램 폴더의 `local_runtime_win`

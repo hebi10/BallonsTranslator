@@ -44,6 +44,9 @@ jobs:
       - name: Parse and test Windows launch scripts
         shell: powershell
         run: ./scripts/test_local_windows.ps1
+      - name: Regression test embeddable Python package builds
+        shell: powershell
+        run: ./scripts/test_embedded_pip.ps1
       - name: Compile source
         run: python -m compileall -q ballontranslator scripts
       - name: Test packaging boundaries

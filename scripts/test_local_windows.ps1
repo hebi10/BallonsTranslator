@@ -1,6 +1,6 @@
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
-$Files = @('install_local.ps1', 'start_local.ps1', 'local_windows_helpers.ps1')
+$Files = @('install_local.ps1', 'start_local.ps1', 'local_windows_helpers.ps1', 'test_embedded_pip.ps1')
 foreach ($File in $Files) {
     $Tokens = $null
     $ParseErrors = $null

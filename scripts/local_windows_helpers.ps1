@@ -7,6 +7,21 @@ function Invoke-CheckedNative {
     if ($LASTEXITCODE -ne 0) { throw "Command failed with exit code $LASTEXITCODE : $Executable" }
 }
 
+# The Windows embeddable Python uses python312._pth and ignores PYTHONPATH.
+# pip's build-isolation backend would consequently be unreachable. Install
+# the build backend into this runtime and build source dependencies in-place.
+function Initialize-EmbeddedPythonPackaging {
+    param([string]$PythonExe, [string]$GetPipScript)
+    Invoke-CheckedNative $PythonExe @($GetPipScript, '--no-warn-script-location')
+    Invoke-CheckedNative $PythonExe @('-m', 'pip', 'install', '--disable-pip-version-check', '--no-warn-script-location', '--upgrade', 'setuptools>=70,<81', 'wheel')
+    Invoke-CheckedNative $PythonExe @('-c', 'import setuptools.build_meta; import wheel')
+}
+
+function Install-EmbeddedPythonRequirements {
+    param([string]$PythonExe, [string]$RequirementsFile)
+    Invoke-CheckedNative $PythonExe @('-m', 'pip', 'install', '--disable-pip-version-check', '--no-warn-script-location', '--no-build-isolation', '--prefer-binary', '-r', $RequirementsFile)
+}
+
 function Set-LocalProcessEnvironment {
     [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
     $script:OutputEncoding = [Console]::OutputEncoding
