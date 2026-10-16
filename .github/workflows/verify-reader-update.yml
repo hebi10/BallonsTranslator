@@ -44,7 +44,7 @@ jobs:
               assert all(p.is_file() for p in fragments), 'Incomplete update fragments'
               packed = base64.b64decode(''.join(p.read_text(encoding='utf-8') for p in fragments), validate=True)
               assert hashlib.sha256(packed).hexdigest() == 'a12d20174f3cce0ba56b71ee4f1d6ee800aec52994409f9a2f3202061d365124', 'Update digest mismatch'
-              decoded = lzma.decompress(packed, memlimit=64 * 1024 * 1024)
+              decoded = lzma.decompress(packed, memlimit=128 * 1024 * 1024)
               assert len(decoded) < 1024 * 1024
               payload = json.loads(decoded)
               allowed = ('ballontranslator/', 'tests/', 'doc/', 'docs/superpowers/', 'scripts/run_local_regressions.py')
