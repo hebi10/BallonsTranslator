@@ -160,6 +160,7 @@ class LocalWorkspaceTest(unittest.TestCase):
             self.dialog.start_next()
             self.assertEqual(pcfg.module.translate_source, 'English')
             self.assertEqual(pcfg.module.ocr, 'mit48px')
+            self.dialog.set_controls()
             self.assertFalse(self.dialog.source_combo.isEnabled())
 
     def test_language_sensitive_model_test_uses_worker_snapshot(self):
