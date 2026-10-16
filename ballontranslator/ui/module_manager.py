@@ -641,7 +641,11 @@ class TranslateThread(ModuleThread):
         self,
         project: ProjImgTrans,
         page_key: str,
-    ):
+    ) -> bool:
+        if getattr(self, 'continue_mode', False) and project.page_stage_finished(
+            page_key, RunStatus.FIN_TRANSLATE,
+        ):
+            return True
         page = project.pages[page_key]
         # A failed or partially completed full-page request must never leave the
         # old page eligible as history.
@@ -669,8 +673,10 @@ class TranslateThread(ModuleThread):
             if self.pipeline_stop_event is not None:
                 self.pipeline_stop_event.set()
         except LLMRequestStopped:
-            success = False
             LOGGER.info('Translation stopped by user.')
+            if self.pipeline_stop_event is not None:
+                self.pipeline_stop_event.set()
+            return False
         except Exception as e:
             success = False
             _create_page_error_dialog(
@@ -680,6 +686,11 @@ class TranslateThread(ModuleThread):
                 page_key,
                 self.tr('Page'),
             )
+        if not success:
+            if not project.page_stage_finished(page_key, RunStatus.FIN_TRANSLATE):
+                project.mark_stage_failed(page_key, 'translate')
+            if self.pipeline_stop_event is not None:
+                self.pipeline_stop_event.set()
         return success
 
     def push_pagekey_queue(self, page_key: str):
@@ -707,7 +718,8 @@ class TranslateThread(ModuleThread):
             page_key = self.pipeline_pagekey_queue.pop(0)
             self.blockSignals(True)
             try:
-                self._translate_page(self.imgtrans_proj, page_key)
+                if not self._translate_page(self.imgtrans_proj, page_key):
+                    stop_event.set()
             except Exception as e:
                 # TODO: allowing retry/skip/terminate
                 msg = '{}\n{}: {}'.format(
@@ -723,6 +735,8 @@ class TranslateThread(ModuleThread):
                     
                 self.blockSignals(False)
                 create_error_dialog(e, msg, 'TranslationFailed')
+                self.imgtrans_proj.mark_stage_failed(page_key, 'translate')
+                stop_event.set()
                 # self.imgtrans_proj = None
                 # self.finished_counter = 0
                 # self.pipeline_pagekey_queue = []
@@ -773,6 +787,7 @@ class ImgtransThread(QThread):
         self.stop_event = threading.Event()
         self._pipeline_stop_emitted = False
         self.pages_to_process = None
+        self.continue_mode = False
         register_global_callback('user_request_stop', self.isStopRequested)
 
     def on_module_thread_stopped(self):
@@ -815,8 +830,10 @@ class ImgtransThread(QThread):
         self,
         imgtrans_proj: ProjImgTrans,
         pages_to_process=None,
-    ):
+        continue_mode: bool = False,
+    ) -> None:
         self.imgtrans_proj = imgtrans_proj
+        self.continue_mode = continue_mode
         self.pages_to_process = pages_to_process  # 保存需要处理的页面列表
         self.num_pages = len(self.imgtrans_proj.pages)
         self.clearStopRequest()
@@ -836,6 +853,9 @@ class ImgtransThread(QThread):
         exception_type: str,
         page_key: str = None,
     ):
+        stage = {'TextDetectFailed': 'detect', 'OCRFailed': 'ocr'}.get(exception_type)
+        if stage is not None and page_key is not None:
+            self.imgtrans_proj.mark_stage_failed(page_key, stage)
         _create_page_error_dialog(
             exception,
             error_msg,
@@ -898,9 +918,12 @@ class ImgtransThread(QThread):
                 page_key,
                 self.tr('Page'),
             )
+            if full_page and project is not None and page_key is not None:
+                project.mark_stage_failed(page_key, 'translate')
             self.requestStop()
         except LLMRequestStopped:
             LOGGER.info('Translation stopped by user.')
+            self.requestStop()
         except Exception as e:
             _create_page_error_dialog(
                 e,
@@ -909,6 +932,8 @@ class ImgtransThread(QThread):
                 page_key,
                 self.tr('Page'),
             )
+            if full_page and project is not None and page_key is not None:
+                project.mark_stage_failed(page_key, 'translate')
         return False
 
     def _translate_full_page(
@@ -926,7 +951,12 @@ class ImgtransThread(QThread):
         )
         if success:
             _mark_translation_finished(project, page_key, self.translator)
+        else:
+            self.requestStop()
         return success
+
+    def _resume_stage_finished(self, page_key: str, code: int) -> bool:
+        return self.continue_mode and self.imgtrans_proj.page_stage_finished(page_key, code)
 
     def _blktrans_pipeline(
         self,
@@ -1101,6 +1131,7 @@ class ImgtransThread(QThread):
         else:
             self.parallel_trans = False
         if self.parallel_trans and cfg_module.enable_translate:
+            self.translate_thread.continue_mode = self.continue_mode
             self.translate_thread.runTranslatePipeline(self.imgtrans_proj, self.stop_event)
 
         for imgname in pages_to_iterate:
@@ -1114,7 +1145,7 @@ class ImgtransThread(QThread):
             mask = blk_list = None
             need_save_mask = False
             blk_removed: List[TextBlock] = []
-            if cfg_module.enable_detect:
+            if cfg_module.enable_detect and not self._resume_stage_finished(imgname, RunStatus.FIN_DET):
                 # Detection can replace or reorder blocks, so old translations
                 # are never compatible even if detection later fails.
                 self.imgtrans_proj.begin_detection(imgname)
@@ -1138,17 +1169,24 @@ class ImgtransThread(QThread):
                         mask = np.bitwise_or(mask, existed_mask)
                 self.imgtrans_proj.pages[imgname] = blk_list
 
-                if mask is not None and not cfg_module.enable_ocr:
+                if mask is not None:
                     self.imgtrans_proj.save_mask(imgname, mask)
                     need_save_mask = False
                     
                 self.imgtrans_proj.update_page_progress(imgname, RunStatus.FIN_DET)
                 self.update_detect_progress.emit(self.detect_counter)
+            elif cfg_module.enable_detect:
+                self.detect_counter += 1
+                self.update_detect_progress.emit(self.detect_counter)
 
             if blk_list is None:
                 blk_list = self.imgtrans_proj.pages[imgname] if imgname in self.imgtrans_proj.pages else []
 
-            if cfg_module.enable_ocr:
+            if cfg_module.enable_ocr and not self._resume_stage_finished(imgname, RunStatus.FIN_OCR):
+                # OCR can alter text, remove empty blocks and change the mask.
+                self.imgtrans_proj.clear_page_progress(
+                    imgname, RunStatus.FIN_OCR | RunStatus.FIN_TRANSLATE | RunStatus.FIN_INPAINT,
+                )
                 if hasattr(self.ocr, 'set_stop_event'):
                     self.ocr.set_stop_event(self.stop_event)
                 try:
@@ -1209,6 +1247,7 @@ class ImgtransThread(QThread):
                         imgname,
                         self.tr('Page'),
                     )
+                    self.imgtrans_proj.mark_stage_failed(imgname, 'ocr')
                     self.requestStop()
                     break
                 except LLMRequestStopped:
@@ -1225,6 +1264,9 @@ class ImgtransThread(QThread):
                     break
                 self.imgtrans_proj.update_page_progress(imgname, RunStatus.FIN_OCR)
                 self.update_ocr_progress.emit(self.ocr_counter)
+            elif cfg_module.enable_ocr:
+                self.ocr_counter += 1
+                self.update_ocr_progress.emit(self.ocr_counter)
 
             if need_save_mask and mask is not None:
                 self.imgtrans_proj.save_mask(imgname, mask)
@@ -1235,11 +1277,9 @@ class ImgtransThread(QThread):
                 if self.parallel_trans:
                     self.translate_thread.push_pagekey_queue(imgname)
                 elif not low_vram_trans:
-                    self._translate_full_page(
-                        self.imgtrans_proj,
-                        imgname,
-                        blk_list,
-                    )
+                    if not self._resume_stage_finished(imgname, RunStatus.FIN_TRANSLATE):
+                        if not self._translate_full_page(self.imgtrans_proj, imgname, blk_list):
+                            break
                     if self.isStopRequested():
                         break
                     self.translate_counter += 1
@@ -1249,7 +1289,8 @@ class ImgtransThread(QThread):
                 LOGGER.info('Image translation pipeline stopped.')
                 break
                         
-            if cfg_module.enable_inpaint:
+            if cfg_module.enable_inpaint and not self._resume_stage_finished(imgname, RunStatus.FIN_INPAINT):
+                self.imgtrans_proj.clear_page_progress(imgname, RunStatus.FIN_INPAINT)
                 if hasattr(self.inpainter, 'set_stop_event'):
                     self.inpainter.set_stop_event(self.stop_event)
                 if mask is None:
@@ -1267,6 +1308,7 @@ class ImgtransThread(QThread):
                             imgname,
                             self.tr('Page'),
                         )
+                        self.imgtrans_proj.mark_stage_failed(imgname, 'inpaint')
                         self.requestStop()
                         break
                     except LLMRequestStopped:
@@ -1281,9 +1323,15 @@ class ImgtransThread(QThread):
                             imgname,
                             self.tr('Page'),
                         )
+                        self.imgtrans_proj.mark_stage_failed(imgname, 'inpaint')
+                        self.requestStop()
+                        break
                     
                 self.inpaint_counter += 1
                 self.imgtrans_proj.update_page_progress(imgname, RunStatus.FIN_INPAINT)
+                self.update_inpaint_progress.emit(self.inpaint_counter)
+            elif cfg_module.enable_inpaint:
+                self.inpaint_counter += 1
                 self.update_inpaint_progress.emit(self.inpaint_counter)
             else:
                 if len(blk_removed) > 0:
@@ -1298,11 +1346,9 @@ class ImgtransThread(QThread):
                     break
                     
                 blk_list = self.imgtrans_proj.pages[imgname]
-                self._translate_full_page(
-                    self.imgtrans_proj,
-                    imgname,
-                    blk_list,
-                )
+                if not self._resume_stage_finished(imgname, RunStatus.FIN_TRANSLATE):
+                    if not self._translate_full_page(self.imgtrans_proj, imgname, blk_list):
+                        break
                 if self.isStopRequested():
                     break
                 self.translate_counter += 1
@@ -1349,9 +1395,12 @@ class ImgtransThread(QThread):
             self._emit_pipeline_stopped_if_ready(imgtrans_running=False)
         except LLMRequestStopped:
             LOGGER.info('Image translation task stopped by user.')
+            self.requestStop()
             self._emit_pipeline_stopped_if_ready(imgtrans_running=False)
         except Exception as e:
             create_error_dialog(e, self.tr('Image translation failed.'), 'ImageTranslationFailed')
+            self.requestStop()
+            self._emit_pipeline_stopped_if_ready(imgtrans_running=False)
         finally:
             self.job = None
 
@@ -1789,9 +1838,18 @@ class ModuleManager(QObject):
         self.prepare_msgbox.setFixedWidth(self.progress_msgbox.sizeHint().width())
         self.prepare_msgbox.show_fitted()
 
-    def cancelModulePreparation(self):
+    def cancelModulePreparation(self) -> None:
         if self._preparing_thread is not None:
             self._preparing_thread.requestCancelModuleInit()
+        # A model can finish loading just as cancellation arrives. Remove the
+        # continuation now so its late success cannot start a cancelled job.
+        self._finish_pending_prepare_failure()
+        on_failure = self._pending_batch_package_failure
+        self._pending_batch_package_queue = []
+        self._pending_batch_package_success = None
+        self._pending_batch_package_failure = None
+        if on_failure is not None:
+            on_failure()
 
     @staticmethod
     def _installing_packages_summary(requirements: List[str]) -> str:
@@ -2075,7 +2133,8 @@ class ModuleManager(QObject):
         self,
         pages_to_process=None,
         render_only=False,
-    ):
+        continue_mode: bool = False,
+    ) -> None:
         _reset_llm_key_required_dialogs()
         if self.imgtrans_proj.is_empty:
             LOGGER.info('proj file is empty, nothing to do')
@@ -2117,14 +2176,16 @@ class ModuleManager(QObject):
             required_modules,
             lambda: self._startImgtransPipeline(
                 pages_to_process,
+                continue_mode=continue_mode,
             ),
-            on_failure=lambda: self.imgtrans_pipeline_finished.emit() if shared.HEADLESS else None,
+            on_failure=self.imgtrans_pipeline_finished.emit,
         )
 
     def _startImgtransPipeline(
         self,
         pages_to_process=None,
-    ):
+        continue_mode: bool = False,
+    ) -> None:
         if self.prepare_msgbox is not None and self.prepare_msgbox.isVisible():
             self.prepare_msgbox.done(0)
         self.progress_msgbox.detect_bar.setVisible(cfg_module.enable_detect)
@@ -2136,12 +2197,14 @@ class ModuleManager(QObject):
         self.imgtrans_thread.runImgtransPipeline(
             self.imgtrans_proj,
             pages_to_process,
+            continue_mode=continue_mode,
         )
     
-    def stopImgtransPipeline(self):
+    def stopImgtransPipeline(self) -> None:
         """停止图像翻译流程"""
         LOGGER.info('Stopping image translation pipeline...')
         self.imgtrans_thread.requestStop()
+        self.cancelModulePreparation()
 
     def runBlktransPipeline(
         self,

@@ -1,0 +1,60 @@
+name: Local Windows bootstrap package
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ['hebi-local', 'codex/**']
+    paths:
+      - 'ballontranslator/**'
+      - 'scripts/**'
+      - 'tests/**'
+      - 'requirements*.txt'
+      - 'launch_local.bat'
+      - '.github/workflows/local-windows.yml'
+  pull_request:
+    paths:
+      - 'ballontranslator/**'
+      - 'scripts/**'
+      - 'tests/**'
+      - 'requirements*.txt'
+      - 'launch_local.bat'
+      - '.github/workflows/local-windows.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  verify-package:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      QT_QPA_PLATFORM: offscreen
+      OLLAMA_NO_CLOUD: '1'
+      HF_HUB_OFFLINE: '1'
+      TRANSFORMERS_OFFLINE: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install UI and test dependencies
+        run: python -m pip install -r requirements.txt pytest "openai>=2.8.1"
+      - name: Parse and test Windows launch scripts
+        shell: powershell
+        run: ./scripts/test_local_windows.ps1
+      - name: Compile source
+        run: python -m compileall -q ballontranslator scripts
+      - name: Test packaging boundaries
+        run: python -m unittest discover -s scripts/tests -v
+      - name: Run local regression files in separate processes
+        run: python scripts/run_local_regressions.py
+      - name: Build source and bootstrap package
+        run: python scripts/build_local_package.py --output release/BallonsTranslator-Local-Windows-source.zip
+      - name: Upload Windows source/bootstrap ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: BallonsTranslator-Local-Windows-source
+          path: release/BallonsTranslator-Local-Windows-source.zip
+          if-no-files-found: error
+          retention-days: 30

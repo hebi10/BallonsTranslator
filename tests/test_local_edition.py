@@ -1,0 +1,98 @@
+from unittest.mock import patch
+import json
+import subprocess
+import sys
+
+from ballontranslator.utils import local_edition
+from ballontranslator.utils.config import ProgramConfig
+
+
+def test_profile_is_fixed_local_and_does_not_mutate_existing_config_file(tmp_path):
+    old = tmp_path / 'config.json'
+    old.write_text('{"keep":"user settings"}', encoding='utf-8')
+    config = ProgramConfig()
+    local_edition.apply_local_profile(config)
+    assert (config.module.textdetector, config.module.ocr, config.module.inpainter,
+            config.module.translator) == ('ctd', 'manga_ocr', 'lama_large_512px', 'LLMTranslator')
+    assert config.module.translate_target == '한국어'
+    assert len(config.module.llm_profiles) == 1
+    profile = config.module.llm_profiles[0]
+    assert profile.model == local_edition.MODEL_TAG
+    assert profile.base_url == 'http://127.0.0.1:11435/v1'
+    assert not profile.support_vision and not profile.support_image
+    assert not config.check_update_on_startup
+    assert old.read_text(encoding='utf-8') == '{"keep":"user settings"}'
+
+
+def test_profile_keeps_user_glossary_and_prompt():
+    config = ProgramConfig()
+    local_edition.apply_local_profile(config)
+    config.module.llm_glossary_path = 'my-terms.tsv'
+    config.module.llm_profiles[0].prompt += ' Character A uses polite Korean.'
+    local_edition.apply_local_profile(config)
+    assert config.module.llm_glossary_path == 'my-terms.tsv'
+    assert 'Character A' in config.module.llm_profiles[0].prompt
+
+
+def test_local_catalog_contains_only_recommended_modules():
+    assert local_edition.module_allowed('translator', 'LLMTranslator')
+    assert not local_edition.module_allowed('translator', 'google')
+    assert not local_edition.module_allowed('ocr', 'mit48px')
+    assert not local_edition.module_allowed('inpainter', 'LLMInpaint')
+
+
+def test_readiness_is_passive_and_reports_missing_files():
+    with patch('ballontranslator.utils.local_edition._model_files_present', return_value=False):
+        items = local_edition.local_readiness()
+    assert len(items) == 4
+    assert all(isinstance(item[1], bool) for item in items)
+    assert not any(item[1] for item in items[:3])
+
+
+def test_active_runtime_exposes_only_fixed_catalog():
+    result = subprocess.run([sys.executable, '-c', '''
+import json
+from ballontranslator.utils.local_edition import activate_local_edition
+activate_local_edition()
+from ballontranslator.modules import GET_VALID_TRANSLATORS, GET_VALID_OCR, GET_VALID_INPAINTERS, TRANSLATORS
+print(json.dumps([GET_VALID_TRANSLATORS(), GET_VALID_OCR(), GET_VALID_INPAINTERS(), TRANSLATORS.get_spec('LLMTranslator').dependencies]))
+'''], text=True, capture_output=True, check=True)
+    assert json.loads(result.stdout.strip().splitlines()[-1]) == [
+        ['LLMTranslator'], ['manga_ocr'], ['lama_large_512px'], []]
+
+
+def test_local_requester_uses_native_client_without_openai():
+    from ballontranslator.modules.llm_chat import LLMChatRequester
+    config = ProgramConfig()
+    local_edition.apply_local_profile(config)
+    requester = LLMChatRequester()
+    with patch.object(local_edition, '_active', True), patch(
+        'ballontranslator.utils.local_ollama.OllamaClient.chat',
+        return_value={'content': '번역', 'finish_reason': 'stop', 'usage': {}},
+    ) as native, patch.object(requester, '_initialize_client', side_effect=AssertionError('cloud client')):
+        result = requester.request_chat_completion(config.module.llm_profiles[0], {
+            'model': local_edition.MODEL_TAG, 'messages': [],
+        })
+    assert result.content == '번역'
+    native.assert_called_once()
+
+
+def test_local_translator_separates_image_and_language_model_memory():
+    from ballontranslator.modules.translators.trans_llm import LLMTranslator
+    translator = LLMTranslator('日本語', '한국어', raise_unsupported_lang=False)
+    with patch.object(local_edition, '_active', True):
+        assert translator.low_vram_mode
+
+
+def test_local_edition_rejects_image_generation_before_selecting_a_profile():
+    import pytest
+    from ballontranslator.ui.text_engine.effects.image_generation import (
+        ImageGenerationBackendUnavailable, create_image_generation_backend,
+    )
+    from ballontranslator.utils.text_effects import ImageGenerationRecipe
+    with patch.object(local_edition, '_active', True), patch(
+        'ballontranslator.ui.text_engine.effects.image_generation.profile_by_id',
+        side_effect=AssertionError('remote profile lookup'),
+    ), pytest.raises(ImageGenerationBackendUnavailable, match='로컬'):
+        create_image_generation_backend(ImageGenerationRecipe())
+

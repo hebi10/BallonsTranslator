@@ -1,0 +1,6 @@
+-r requirements.txt
+# Existing selected-backend dependencies. Torch/torchvision use the upstream GPU selector.
+transformers==4.57.6
+jaconv
+fugashi
+unidic-lite

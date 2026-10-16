@@ -98,6 +98,11 @@ class LLMImageGenerationBackend(ImageGenerationBackend):
 def create_image_generation_backend(
     recipe: ImageGenerationRecipe,
 ) -> ImageGenerationBackend:
+    from ballontranslator.utils.local_edition import is_local_edition
+    if is_local_edition():
+        raise ImageGenerationBackendUnavailable(
+            '로컬 전용 버전에서는 원격 이미지 생성을 사용할 수 없습니다.'
+        )
     if recipe.backend != 'llm':
         raise ImageGenerationBackendUnavailable(
             QCoreApplication.translate(

@@ -182,6 +182,11 @@ class LLMTranslator(LLMChatRequester, BaseTranslator):
         ] = {}
 
     @property
+    def low_vram_mode(self) -> bool:
+        from ballontranslator.utils.local_edition import is_local_edition
+        return is_local_edition() or super().low_vram_mode
+
+    @property
     def profile(self) -> LLMProfile:
         profile = runtime_profile(
             pcfg.module.llm_profiles,

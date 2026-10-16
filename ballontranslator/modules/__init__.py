@@ -5,10 +5,15 @@ from .inpaint import INPAINTERS, InpainterBase
 from .base import DEFAULT_DEVICE, GPUINTENSIVE_SET, LOGGER, merge_config_module_params, \
     init_module_registries
 
-GET_VALID_TEXTDETECTORS = lambda : list(TEXTDETECTORS.module_dict.keys())
-GET_VALID_TRANSLATORS = lambda : list(TRANSLATORS.module_dict.keys())
-GET_VALID_INPAINTERS = lambda : list(INPAINTERS.module_dict.keys())
-GET_VALID_OCR = lambda : list(OCR.module_dict.keys())
+def _available_modules(kind, registry):
+    from ballontranslator.utils.local_edition import is_local_edition, module_allowed
+    return [key for key in registry.module_dict if not is_local_edition() or module_allowed(kind, key)]
+
+
+GET_VALID_TEXTDETECTORS = lambda: _available_modules('textdetector', TEXTDETECTORS)
+GET_VALID_TRANSLATORS = lambda: _available_modules('translator', TRANSLATORS)
+GET_VALID_INPAINTERS = lambda: _available_modules('inpainter', INPAINTERS)
+GET_VALID_OCR = lambda: _available_modules('ocr', OCR)
 
 
 MODULETYPE_TO_REGISTRIES = {

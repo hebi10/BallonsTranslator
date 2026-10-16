@@ -1353,11 +1353,13 @@ class RunPipelineDialogTests(unittest.TestCase):
 
     def test_continue_dispatches_all_unfinished_pages_ignoring_selected_range(self):
         pcfg.module.set_stage_enabled(0, False)
+        corrected = TextBlock(text=['edited source'], translation='edited Korean')
+        corrected.rich_text = '<p>edited Korean</p>'
         project = SimpleNamespace(
             pages={
                 '001.png': [TextBlock()],
                 '002.png': [TextBlock()],
-                '003.png': [TextBlock()],
+                '003.png': [corrected],
             },
             get_page_progress=lambda page: page == '002.png',
         )
@@ -1390,13 +1392,15 @@ class RunPipelineDialogTests(unittest.TestCase):
 
         self.assertEqual(len(project.pages['002.png']), 1)
         self.assertEqual(len(project.pages['003.png']), 1)
-        self.assertEqual(len(owner.backup_blkstyles), 2)
+        self.assertEqual(corrected.get_text(), 'edited source')
+        self.assertEqual(corrected.translation, 'edited Korean')
+        self.assertEqual(corrected.rich_text, '<p>edited Korean</p>')
         self.assertEqual(
             calls,
             [
                 (
                     (['001.png', '003.png'],),
-                    {'render_only': False},
+                    {'render_only': False, 'continue_mode': True},
                 )
             ],
         )
