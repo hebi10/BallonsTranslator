@@ -70,12 +70,23 @@ class LocalJobQueue:
             state = self.normalize_state(row.get('state'))
             if not isinstance(row.get('state'), str) or row.get('state') not in STATES:
                 invalid += 1
+            review_pages = row.get('review_pages', [])
+            if not isinstance(review_pages, list):
+                review_pages = []
+                invalid += 1
+            valid_review_pages = []
+            for page in review_pages:
+                if not isinstance(page, str) or not page.strip():
+                    invalid += 1
+                elif page not in valid_review_pages:
+                    valid_review_pages.append(page)
             self.jobs.append({
                 'folder': folder, 'state': state,
                 'done': self._count(row.get('done')), 'total': self._count(row.get('total')),
                 'error': row.get('error', '') if isinstance(row.get('error', ''), str) else '',
                 'restart': row.get('restart') is True,
                 'resave': row.get('resave') is True or row.get('state') == 'running',
+                'review_pages': valid_review_pages,
             })
         if invalid:
             self.warning = f'작업 목록에서 잘못된 항목 {invalid}개를 제외했습니다.'
@@ -539,13 +550,20 @@ class LocalWorkspace(QDialog):
         # pause may have cancelled pending rerenders of existing stale files.
         success = success and not self.pause_pending
         job = self.queue.jobs[self.active_index]
-        job.update(state='done' if success else 'paused' if self.pause_pending else 'failed', error=error, done=done, total=total, resave=not success)
+        review_pages = job.get('review_pages', [])
+        if review_pages:
+            success = False
+            error = error or f"말풍선 배치 확인 필요: {', '.join(review_pages)}. 대사를 수정한 뒤 재시도하세요."
+        state = 'done' if success else 'paused' if self.pause_pending and not review_pages else 'failed'
+        job.update(state=state, error=error, done=done, total=total, resave=not success)
         self.active_index = None
         if not self.save_queue():
             self.pause_pending = True
         self.refresh_queue()
         self.status_label.setText(error or ('현재 작업을 안전하게 저장하고 일시정지했습니다.' if self.pause_pending else '폴더 번역이 완료되었습니다.'))
         self.start_next()
+        if self.active_index is None and error:
+            self.status_label.setText(error)
 
     def request_pause(self) -> None:
         if self.running:

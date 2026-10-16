@@ -29,6 +29,7 @@ jobs:
     timeout-minutes: 30
     env:
       QT_QPA_PLATFORM: offscreen
+      QT_API: pyqt6
       OLLAMA_NO_CLOUD: '1'
       HF_HUB_OFFLINE: '1'
       TRANSFORMERS_OFFLINE: '1'
@@ -39,7 +40,7 @@ jobs:
           python-version: '3.12'
           cache: pip
       - name: Install UI and test dependencies
-        run: python -m pip install -r requirements.txt pytest "openai>=2.8.1"
+        run: python -m pip install -r requirements.txt pytest "openai>=2.8.1" "PyQt5==5.15.11"
       - name: Parse and test Windows launch scripts
         shell: powershell
         run: ./scripts/test_local_windows.ps1
@@ -49,6 +50,10 @@ jobs:
         run: python -m unittest discover -s scripts/tests -v
       - name: Run local regression files in separate processes
         run: python scripts/run_local_regressions.py
+      - name: Verify Korean typesetting with Qt 5
+        env:
+          QT_API: pyqt5
+        run: python scripts/run_local_regressions.py --files tests/test_korean_segmentation.py tests/test_korean_layout.py tests/test_local_workspace.py
       - name: Build source and bootstrap package
         run: python scripts/build_local_package.py --output release/BallonsTranslator-Local-Windows-source.zip
       - name: Upload Windows source/bootstrap ZIP

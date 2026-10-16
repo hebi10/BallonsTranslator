@@ -69,6 +69,27 @@ class LocalQueueTest(unittest.TestCase):
         self.assertEqual(queue.jobs[0]['state'], 'pending')
         self.assertEqual(queue.jobs[0]['total'], 0)
 
+    def test_review_pages_survive_recovery_and_only_invalid_entries_are_discarded(self):
+        content = {'version': 1, 'jobs': [
+            {'folder': str(self.folder), 'state': 'failed',
+             'review_pages': ['page.png', 4, '', None, 'page.png', 'next.png']}
+        ]}
+        self.path.write_text(json.dumps(content), encoding='utf-8')
+        queue = LocalJobQueue(self.path)
+        self.assertEqual(queue.jobs[0]['review_pages'], ['page.png', 'next.png'])
+        self.assertTrue(queue.warning)
+        self.assertEqual(json.loads(self.path.read_text(encoding='utf-8')), content)
+        queue.save()
+        self.assertEqual(LocalJobQueue(self.path).jobs[0]['review_pages'], ['page.png', 'next.png'])
+
+    def test_malformed_review_pages_do_not_discard_job(self):
+        self.path.write_text(json.dumps({'version': 1, 'jobs': [
+            {'folder': str(self.folder), 'state': 'failed', 'review_pages': {'page.png': True}}
+        ]}), encoding='utf-8')
+        queue = LocalJobQueue(self.path)
+        self.assertEqual(queue.jobs[0]['review_pages'], [])
+        self.assertTrue(queue.warning)
+
 
 class LocalWorkspaceTest(unittest.TestCase):
     @classmethod
@@ -131,6 +152,316 @@ class LocalWorkspaceTest(unittest.TestCase):
         self.assertEqual(self.dialog.queue.jobs[0]['state'], 'failed')
         self.assertIn('저장 실패', self.dialog.queue.jobs[0]['error'])
         self.assertTrue(self.dialog.queue.jobs[0]['resave'])
+
+    def _review_owner(self):
+        from qtpy.QtGui import QImage
+        from ballontranslator.ui.mainwindow import MainWindow
+        folder = Path(self.tmp.name) / 'review-comic'
+        result = folder / 'result'
+        result.mkdir(parents=True)
+        (result / 'page.png').write_bytes(b'previous-result')
+        self.dialog.queue.add([str(folder)])
+        self.dialog.queue.jobs[0]['review_pages'] = ['page.png']
+        self.dialog.active_index = 0
+        self.dialog.running = True
+        self.dialog.refresh_queue()
+        canvas = Mock()
+        canvas.render_result_img.return_value = QImage(2, 2, QImage.Format.Format_RGB32)
+        project = SimpleNamespace(
+            directory=str(folder), img_valid=True, current_img='page.png',
+            pages={'page.png': []}, is_empty=False, save=Mock(),
+            result_dir=lambda: str(result), get_result_path=lambda _: str(result / 'page.png'),
+            current_has_alpha=lambda: False, get_page_progress=lambda _: True,
+            failed_pages=lambda: [], mask_array=None, inpainted_array=None,
+            get_mask_path=lambda: str(folder / 'mask.png'),
+            get_inpainted_path=lambda: str(folder / 'inpainted.png'),
+        )
+        canvas.drawingLayer.drawed.return_value = False
+        owner = SimpleNamespace(
+            local_workspace=self.dialog, imgtrans_proj=project,
+            canvas=canvas, imsave_thread=Mock(error_count=0, isBusy=Mock(return_value=False)),
+            st_manager=Mock(
+                textblk_item_list=[SimpleNamespace(idx=0), SimpleNamespace(idx=1)],
+                korean_layout_fits=Mock(return_value=False), auto_layout_failed=[],
+                txtblkShapeControl=Mock(isVisible=Mock(return_value=False)),
+            ),
+            rightComicTransStackPanel=Mock(isHidden=Mock(return_value=False)),
+            module_manager=Mock(), _local_output_dir=result,
+            _local_pending_folder=None, _local_job_finished=False,
+            _local_save_error='', _local_save_errors_before=0,
+            _local_pipeline_busy=lambda: False, _local_timer=Mock(),
+            openDir=Mock(return_value=True), pageList=Mock(),
+        )
+        owner._local_layout_review_job = lambda: MainWindow._local_layout_review_job(owner)
+        owner._hold_local_layout = lambda indices: MainWindow._hold_local_layout(owner, indices)
+        owner.pause_local_queue = lambda: MainWindow.pause_local_queue(owner)
+        owner.saveCurrentPage = lambda *args, **kwargs: MainWindow.saveCurrentPage(owner, *args, **kwargs)
+        owner._resume_local_pipeline = lambda: MainWindow._resume_local_pipeline(owner)
+        owner.pageList.currentRow.return_value = 0
+        return owner, result
+
+    def test_unresolved_layout_preserves_project_and_existing_result_on_retry(self):
+        from ballontranslator.ui.mainwindow import MainWindow
+        from ballontranslator.utils.config import pcfg
+        owner, result = self._review_owner()
+        with patch.object(pcfg, 'imgtrans_textblock', False):
+            self.assertFalse(owner.saveCurrentPage(False, False))
+        owner.canvas.render_result_img.assert_not_called()
+        owner.imsave_thread.saveImg.assert_not_called()
+        owner.st_manager.updateTextBlkList.assert_called_once()
+        owner.imgtrans_proj.save.assert_called_once()
+        self.assertEqual((result / 'page.png').read_bytes(), b'previous-result')
+        restored = LocalJobQueue(self.dialog.queue.path)
+        self.assertEqual(restored.jobs[0]['review_pages'], ['page.png'])
+        MainWindow.poll_local_queue(owner)
+        self.assertEqual(self.dialog.queue.jobs[0]['state'], 'failed')
+        self.assertIn('page.png', self.dialog.queue.jobs[0]['error'])
+        self.assertIn('1, 2', self.dialog.queue.jobs[0]['error'])
+        self.dialog.retry_failed()
+        MainWindow._begin_local_folder(owner, owner.imgtrans_proj.directory)
+        self.assertEqual(owner._local_render_pending, [0])
+        with patch.object(pcfg, 'imgtrans_textblock', False):
+            MainWindow.poll_local_queue(owner)
+        owner.canvas.render_result_img.assert_not_called()
+        self.assertEqual(self.dialog.queue.jobs[0]['review_pages'], ['page.png'])
+
+    def test_corrected_review_page_is_exported_and_review_cleared(self):
+        from ballontranslator.utils.config import pcfg
+        owner, _ = self._review_owner()
+        owner.st_manager.korean_layout_fits.return_value = True
+        with patch.object(pcfg, 'imgtrans_textblock', False):
+            self.assertTrue(owner.saveCurrentPage(False, False))
+        self.assertEqual(owner.st_manager.korean_layout_fits.call_count, 2)
+        owner.canvas.render_result_img.assert_called_once()
+        owner.imsave_thread.saveImg.assert_called_once()
+        self.assertEqual(self.dialog.queue.jobs[0]['review_pages'], [])
+        self.assertEqual(LocalJobQueue(self.dialog.queue.path).jobs[0]['review_pages'], [])
+        owner.module_manager.runImgtransPipeline.assert_not_called()
+        owner.st_manager.layout_textblk.assert_not_called()
+
+    def test_review_marker_survives_result_render_failure(self):
+        from ballontranslator.utils.config import pcfg
+        owner, _ = self._review_owner()
+        owner.st_manager.korean_layout_fits.return_value = True
+        owner.canvas.render_result_img.side_effect = RuntimeError('render failed')
+        with patch.object(pcfg, 'imgtrans_textblock', False):
+            self.assertFalse(owner.saveCurrentPage(False, False))
+        self.assertEqual(self.dialog.queue.jobs[0]['review_pages'], ['page.png'])
+        owner.canvas.setProjSaveState.assert_called_with(True)
+
+    def test_unresolved_review_cannot_be_marked_done_even_when_output_exists(self):
+        owner, _ = self._review_owner()
+        self.dialog.finish_job(True, '', 1, 1)
+        job = self.dialog.queue.jobs[0]
+        self.assertEqual(job['state'], 'failed')
+        self.assertTrue(job['resave'])
+        self.assertIn('page.png', job['error'])
+        self.assertIn('page.png', self.dialog.status_label.text())
+
+    def test_new_auto_layout_failure_is_held_before_first_result_export(self):
+        from ballontranslator.ui.mainwindow import MainWindow
+        owner, result = self._review_owner()
+        self.dialog.queue.jobs[0]['review_pages'] = []
+        owner.imgtrans_proj.get_blklist_byidx = lambda _: []
+        owner.imgtrans_proj.num_pages = 1
+        owner.imgtrans_proj.set_current_img_byidx = Mock()
+        owner.backup_blkstyles = []
+        owner._render_global_format = None
+        owner._render_only = False
+        owner._run_imgtrans_wo_textstyle_update = False
+        owner.postprocess_translations = Mock()
+        owner.textPanel = Mock()
+        owner.llmContextEditor = Mock()
+        owner.pageList.currentIndex.return_value.row.return_value = 0
+        owner.st_manager.auto_layout_failed = [1]
+        MainWindow.on_pagtrans_finished(owner, 0)
+        self.assertEqual(self.dialog.queue.jobs[0]['review_pages'], ['page.png'])
+        self.assertIn('말풍선 2', owner._local_save_error)
+        owner.canvas.render_result_img.assert_not_called()
+        owner.imgtrans_proj.save.assert_called_once()
+        owner.st_manager.updateTextBlkList.assert_called_once()
+        self.assertEqual((result / 'page.png').read_bytes(), b'previous-result')
+
+    def test_explicit_editor_save_preserves_manual_export_behavior(self):
+        from ballontranslator.utils.config import pcfg
+        owner, _ = self._review_owner()
+        with patch.object(pcfg, 'imgtrans_textblock', False):
+            self.assertTrue(owner.saveCurrentPage(False, False, check_local_layout=False))
+        owner.st_manager.korean_layout_fits.assert_not_called()
+        owner.canvas.render_result_img.assert_called_once()
+        self.assertEqual(self.dialog.queue.jobs[0]['review_pages'], ['page.png'])
+
+    def test_layout_hold_preserves_dirty_edits_when_project_save_fails(self):
+        owner, _ = self._review_owner()
+        owner.imgtrans_proj.save.side_effect = OSError('disk full')
+        self.assertFalse(owner.saveCurrentPage(False, False))
+        owner.canvas.render_result_img.assert_not_called()
+        owner.canvas.setProjSaveState.assert_called_with(True)
+        self.assertIn('disk full', owner._local_save_error)
+        self.assertEqual(LocalJobQueue(self.dialog.queue.path).jobs[0]['review_pages'], ['page.png'])
+
+    def test_review_marker_is_retained_if_queue_save_after_render_fails(self):
+        from ballontranslator.utils.config import pcfg
+        owner, _ = self._review_owner()
+        owner.st_manager.korean_layout_fits.return_value = True
+        with patch.object(pcfg, 'imgtrans_textblock', False), patch.object(self.dialog, 'save_queue', return_value=False):
+            self.assertFalse(owner.saveCurrentPage(False, False))
+        self.assertEqual(self.dialog.queue.jobs[0]['review_pages'], ['page.png'])
+        owner.canvas.setProjSaveState.assert_called_with(True)
+
+    def test_old_review_page_is_revalidated_even_when_resume_outputs_already_exist(self):
+        from ballontranslator.ui.mainwindow import MainWindow
+        owner, _ = self._review_owner()
+        self.dialog.queue.jobs[0]['resave'] = False
+        MainWindow._begin_local_folder(owner, owner.imgtrans_proj.directory)
+        self.assertEqual(owner._local_render_pending, [0])
+        owner.module_manager.runImgtransPipeline.assert_not_called()
+
+    def test_completed_legacy_project_is_checked_before_automatic_export(self):
+        owner, result = self._review_owner()
+        self.dialog.queue.jobs[0]['review_pages'] = []
+        self.assertFalse(owner.saveCurrentPage(False, False))
+        owner.canvas.render_result_img.assert_not_called()
+        self.assertEqual(self.dialog.queue.jobs[0]['review_pages'], ['page.png'])
+        self.assertEqual((result / 'page.png').read_bytes(), b'previous-result')
+
+    def test_review_pages_removed_from_project_do_not_block_resume(self):
+        from ballontranslator.ui.mainwindow import MainWindow
+        owner, _ = self._review_owner()
+        self.dialog.queue.jobs[0]['review_pages'] = ['removed.png']
+        MainWindow._begin_local_folder(owner, owner.imgtrans_proj.directory)
+        self.assertEqual(self.dialog.queue.jobs[0]['review_pages'], [])
+        self.assertEqual(LocalJobQueue(self.dialog.queue.path).jobs[0]['review_pages'], [])
+
+    def test_explicit_fresh_restart_recomputes_review_state(self):
+        from ballontranslator.ui.mainwindow import MainWindow
+        owner, _ = self._review_owner()
+        self.dialog.queue.jobs[0]['restart'] = True
+        owner.on_run_imgtrans = Mock()
+        MainWindow._begin_local_folder(owner, owner.imgtrans_proj.directory)
+        self.assertEqual(self.dialog.queue.jobs[0]['review_pages'], [])
+        self.assertEqual(LocalJobQueue(self.dialog.queue.path).jobs[0]['review_pages'], [])
+        owner.imgtrans_proj.save.assert_called_once_with(keep_exist_as_backup=True)
+        owner.on_run_imgtrans.assert_called_once_with(continue_mode=False)
+
+    def test_disabled_auto_layout_is_respected_except_for_existing_review(self):
+        from ballontranslator.utils.config import pcfg
+        owner, _ = self._review_owner()
+        self.dialog.queue.jobs[0]['review_pages'] = []
+        with patch.object(pcfg, 'let_autolayout_flag', False), patch.object(pcfg, 'imgtrans_textblock', False):
+            self.assertTrue(owner.saveCurrentPage(False, False))
+            owner.st_manager.korean_layout_fits.assert_not_called()
+            self.dialog.queue.jobs[0]['review_pages'] = ['page.png']
+            owner.canvas.render_result_img.reset_mock()
+            self.assertFalse(owner.saveCurrentPage(False, False))
+        owner.canvas.render_result_img.assert_not_called()
+
+    def test_failed_review_reconciliation_preserves_retry_state(self):
+        from ballontranslator.ui.mainwindow import MainWindow
+        owner, _ = self._review_owner()
+        job = self.dialog.queue.jobs[0]
+        job['review_pages'] = ['removed.png']
+        with patch.object(self.dialog, 'save_queue', return_value=False):
+            with self.assertRaises(OSError):
+                MainWindow._begin_local_folder(owner, owner.imgtrans_proj.directory)
+            self.assertEqual(job['review_pages'], ['removed.png'])
+            job['restart'] = True
+            with self.assertRaises(OSError):
+                MainWindow._begin_local_folder(owner, owner.imgtrans_proj.directory)
+        self.assertEqual(job['review_pages'], ['removed.png'])
+        self.assertTrue(job['restart'])
+
+    def test_unresolved_previous_folder_cannot_export_when_next_folder_is_active(self):
+        owner, result = self._review_owner()
+        other = Path(self.tmp.name) / 'next-comic'
+        other.mkdir()
+        self.dialog.queue.add([str(other)])
+        self.dialog.finish_job(False, '말풍선 확인 필요', 1, 1)
+        self.assertEqual(self.dialog.active_index, 1)
+        self.assertFalse(owner.saveCurrentPage(False, False))
+        owner.canvas.render_result_img.assert_not_called()
+        self.assertEqual((result / 'page.png').read_bytes(), b'previous-result')
+        self.assertEqual(self.dialog.queue.jobs[0]['review_pages'], ['page.png'])
+        self.assertFalse(self.dialog.queue.jobs[1].get('review_pages'))
+
+    def test_unresolved_page_is_protected_after_queue_stops(self):
+        from ballontranslator.ui.mainwindow import MainWindow
+        owner, result = self._review_owner()
+        self.dialog.finish_job(False, '말풍선 확인 필요', 1, 1)
+        self.assertIsNone(self.dialog.active_index)
+        owner.opening_dir = False
+        owner._llm_context_dirty = False
+        owner.canvas.projstate_unsaved = True
+        owner.canvas.text_change_unsaved.return_value = True
+        owner.canvas.draw_change_unsaved.return_value = False
+        self.assertFalse(MainWindow.conditional_save(owner))
+        owner.canvas.render_result_img.assert_not_called()
+        self.assertEqual((result / 'page.png').read_bytes(), b'previous-result')
+        owner.st_manager.updateTextBlkList.assert_called_once()
+
+    def test_local_headless_export_checks_layout_without_queue(self):
+        from ballontranslator.utils import shared
+        from ballontranslator.utils.config import pcfg
+        owner, result = self._review_owner()
+        owner.local_workspace = None
+        with patch('ballontranslator.ui.mainwindow.is_local_edition', return_value=True), patch.object(shared, 'HEADLESS', True), patch.object(pcfg, 'let_autolayout_flag', True):
+            self.assertFalse(owner.saveCurrentPage(False, False))
+        owner.canvas.render_result_img.assert_not_called()
+        owner.imgtrans_proj.save.assert_called_once()
+        owner.module_manager.stopImgtransPipeline.assert_called_once()
+        self.assertEqual((result / 'page.png').read_bytes(), b'previous-result')
+
+    def test_page_navigation_stays_on_unsaved_scene_when_save_is_held(self):
+        from qtpy.QtWidgets import QListWidget
+        from ballontranslator.ui.mainwindow import MainWindow
+        page_list = QListWidget()
+        self.addCleanup(page_list.deleteLater)
+        page_list.addItems(['first.png', 'second.png'])
+        page_list.setCurrentRow(0)
+        owner = SimpleNamespace(
+            pageList=page_list, opening_dir=False, save_on_page_changed=True,
+            conditional_save=Mock(return_value=False), st_manager=Mock(), canvas=Mock(),
+            imgtrans_proj=SimpleNamespace(current_img='first.png', pages={'first.png': [], 'second.png': []}),
+        )
+        changed = []
+        page_list.currentRowChanged.connect(changed.append)
+        page_list.setCurrentRow(1)
+        MainWindow.pageListCurrentItemChanged(owner)
+        self.assertEqual(page_list.currentRow(), 0)
+        self.assertEqual(len(changed), 1)
+        self.assertFalse(owner.page_changing)
+        owner.st_manager.clearSceneTextitems.assert_not_called()
+        owner.canvas.clear_undostack.assert_not_called()
+        self.assertEqual(owner.imgtrans_proj.current_img, 'first.png')
+
+    def test_close_is_cancelled_if_project_save_is_held(self):
+        from ballontranslator.ui.mainwindow import MainWindow
+        event = Mock()
+        owner = SimpleNamespace(
+            local_workspace=None, font_change_detector=Mock(), font_refresh=Mock(),
+            st_manager=Mock(), auto_tate_chu_yoko_thread=Mock(isRunning=Mock(return_value=False)),
+            imgtrans_proj=SimpleNamespace(is_empty=False), conditional_save=Mock(return_value=False),
+            app=Mock(),
+        )
+        MainWindow.closeEvent(owner, event)
+        event.ignore.assert_called_once()
+        owner.app.quit.assert_not_called()
+        owner.st_manager.clearSceneTextitems.assert_not_called()
+        owner.font_change_detector.stop.assert_not_called()
+        owner.font_refresh.shutdown.assert_not_called()
+
+    def test_resume_does_not_render_previous_page_after_rejected_navigation(self):
+        from ballontranslator.ui.mainwindow import MainWindow
+        from ballontranslator.utils.config import pcfg
+        owner, _ = self._review_owner()
+        owner.imgtrans_proj.pages['second.png'] = []
+        owner._local_render_pending = [1]
+        owner.st_manager.korean_layout_fits.return_value = True
+        with patch.object(pcfg, 'imgtrans_textblock', False):
+            MainWindow.poll_local_queue(owner)
+        owner.canvas.render_result_img.assert_not_called()
+        owner.module_manager.stopImgtransPipeline.assert_called_once()
+        self.assertIn('페이지 전환', owner._local_save_error)
 
     def test_queue_waits_for_image_saves_and_detects_missing_output(self):
         from ballontranslator.ui.mainwindow import MainWindow
@@ -306,6 +637,7 @@ class LocalWorkspaceTest(unittest.TestCase):
         )
         page_list = SimpleNamespace(current=0)
         page_list.setCurrentRow = lambda index: setattr(page_list, 'current', index)
+        page_list.currentRow = lambda: page_list.current
         rendered = []
 
         def save_result(*args):

@@ -300,6 +300,52 @@ class MainWindow(mainwindow_cls):
             or manager._pending_prepare_success is not None
         )
 
+    def _local_layout_review_job(self) -> dict | None:
+        workspace = getattr(self, 'local_workspace', None)
+        directory = self.imgtrans_proj.directory
+        if workspace is None or directory is None:
+            return None
+        current_directory = Path(directory).resolve()
+        for index, job in enumerate(workspace.queue.jobs):
+            if current_directory == Path(job['folder']).resolve():
+                # A queued folder switch changes active_index before the old
+                # page's conditional save. Its review guard must survive that
+                # transition and the later idle editor state.
+                if index == workspace.active_index or self.imgtrans_proj.current_img in job.get('review_pages', []):
+                    return job
+                break
+        return None
+
+    def _hold_local_layout(self, block_indices: list[int]) -> None:
+        job = self._local_layout_review_job()
+        page = self.imgtrans_proj.current_img
+        blocks = ', '.join(str(index + 1) for index in block_indices)
+        error = f'{page} · 말풍선 {blocks}: 글자가 말풍선에 맞지 않습니다. 결과 검수에서 대사나 글자 배치를 수정한 뒤 재시도하세요.'
+        # Record the review before any output can be written. Translation and
+        # editable geometry remain in the project even when output is held.
+        if job is not None:
+            review_pages = job.setdefault('review_pages', [])
+            if page not in review_pages:
+                review_pages.append(page)
+            job['resave'] = True
+            if not self.local_workspace.save_queue():
+                error += ' 작업 목록을 저장하지 못했습니다.'
+        try:
+            self.st_manager.updateTextBlkList()
+            self.imgtrans_proj.save()
+            self._llm_context_dirty = False
+        except Exception as exc:
+            error += f' 프로젝트 저장 실패: {exc}'
+        self._local_save_error = error
+        self.canvas.setProjSaveState(True)
+        self.pause_local_queue()
+        LOGGER.warning(error)
+        workspace = getattr(self, 'local_workspace', None)
+        if workspace is not None:
+            workspace.status_label.setText(error)
+        elif not shared.HEADLESS:
+            create_info_dialog(error)
+
     def start_local_folder(self, folder: str) -> None:
         if self._local_pipeline_busy():
             self.local_workspace.pause_pending = True
@@ -331,16 +377,28 @@ class MainWindow(mainwindow_cls):
         job = workspace.queue.jobs[workspace.active_index]
         if job.get('restart'):
             self.imgtrans_proj.save(keep_exist_as_backup=True)
+            previous_review = job.get('review_pages', [])
             job['restart'] = False
+            job['review_pages'] = []
             if not workspace.save_queue():
+                job['restart'] = True
+                job['review_pages'] = previous_review
                 raise OSError('작업 목록을 저장하지 못하여 새로 번역을 중단했습니다.')
             self.on_run_imgtrans(continue_mode=False)
             return
+        review_pages = job.get('review_pages', [])
+        current_review = [page for page in review_pages if page in self.imgtrans_proj.pages]
+        if current_review != review_pages:
+            LOGGER.warning('Removing layout review entries for pages no longer in the project: %s', [page for page in review_pages if page not in self.imgtrans_proj.pages])
+            job['review_pages'] = current_review
+            if not workspace.save_queue():
+                job['review_pages'] = review_pages
+                raise OSError('작업 목록을 저장하지 못하여 이어서 번역을 중단했습니다.')
         missing = []
         for index, page in enumerate(pages):
             if self.imgtrans_proj.get_page_progress(page):
                 output = self._local_output_dir / Path(self.imgtrans_proj.get_result_path(page)).name
-                if job.get('resave') or not output.is_file() or not Path(self.imgtrans_proj.get_result_path(page)).is_file():
+                if page in job.get('review_pages', []) or job.get('resave') or not output.is_file() or not Path(self.imgtrans_proj.get_result_path(page)).is_file():
                     missing.append(index)
         # Regenerate absent result files from completed project data without
         # asking OCR/translation to overwrite manual edits.
@@ -391,6 +449,10 @@ class MainWindow(mainwindow_cls):
         if getattr(self, '_local_render_pending', None):
             index = self._local_render_pending.pop(0)
             self.pageList.setCurrentRow(index)
+            if self.pageList.currentRow() != index:
+                self._local_save_error = self._local_save_error or '페이지 전환 전 저장을 완료하지 못했습니다.'
+                self.pause_local_queue()
+                return
             if not self.saveCurrentPage(False, False):
                 self.pause_local_queue()
             return
@@ -1091,9 +1153,6 @@ class MainWindow(mainwindow_cls):
             self.show_local_workspace()
             workspace.status_label.setText('진행 중인 작업을 먼저 중지하세요. 저장이 끝난 뒤 프로그램을 닫을 수 있습니다.')
             return
-        if self.font_change_detector is not None:
-            self.font_change_detector.stop()
-        self.font_refresh.shutdown()
         # Pending numeric edits are not dirty until they commit. Resolve them
         # before the close-time dirty check and final config snapshot.
         self.st_manager.formatpanel.resolve_text_transform_edits_for_save()
@@ -1102,7 +1161,12 @@ class MainWindow(mainwindow_cls):
             self.auto_tate_chu_yoko_thread.request_stop()
             self.auto_tate_chu_yoko_thread.wait()
         if not self.imgtrans_proj.is_empty:
-            self.conditional_save(keep_exist_as_backup=True)
+            if self.conditional_save(keep_exist_as_backup=True) is False:
+                event.ignore()
+                return
+        if self.font_change_detector is not None:
+            self.font_change_detector.stop()
+        self.font_refresh.shutdown()
         while True:
             if not self.imsave_thread.isBusy():
                 break
@@ -1181,7 +1245,16 @@ class MainWindow(mainwindow_cls):
                 # before its dirty check. Live drags are previews and cancel.
                 self.st_manager.formatpanel.resolve_text_transform_edits_for_page_change()
             if self.save_on_page_changed:
-                self.conditional_save()
+                if self.conditional_save() is False:
+                    signals_blocked = self.pageList.blockSignals(True)
+                    try:
+                        pages = list(self.imgtrans_proj.pages)
+                        current_page = self.imgtrans_proj.current_img
+                        self.pageList.setCurrentRow(pages.index(current_page) if current_page in pages else -1)
+                    finally:
+                        self.pageList.blockSignals(signals_blocked)
+                    self.page_changing = False
+                    return
             self.st_manager.clearSceneTextitems(
                 SceneTextReplacementReason.PAGE_CHANGE
             )
@@ -1810,9 +1883,9 @@ class MainWindow(mainwindow_cls):
     def manual_save(self) -> None:
         if self.imgtrans_proj.directory is not None:
             LOGGER.debug('Manually saving...')
-            self.saveCurrentPage(update_scene_text=True, save_proj=True, restore_interface=True, save_rst_only=False)
+            self.saveCurrentPage(update_scene_text=True, save_proj=True, restore_interface=True, save_rst_only=False, check_local_layout=False)
 
-    def saveCurrentPage(self, update_scene_text=True, save_proj=True, restore_interface=False, save_rst_only=False, keep_exist_as_backup=False) -> bool:
+    def saveCurrentPage(self, update_scene_text=True, save_proj=True, restore_interface=False, save_rst_only=False, keep_exist_as_backup=False, check_local_layout: bool = True) -> bool:
         
         if not self.imgtrans_proj.img_valid:
             return True
@@ -1823,6 +1896,16 @@ class MainWindow(mainwindow_cls):
             # project snapshot and the result-image render consume it. The
             # render-only translation completion path saves its project first.
             self.st_manager.formatpanel.resolve_text_transform_edits_for_save()
+
+        workspace = getattr(self, 'local_workspace', None)
+        review_job = self._local_layout_review_job() if check_local_layout and workspace is not None else None
+        reviewed_page = review_job is not None and self.imgtrans_proj.current_img in review_job.get('review_pages', [])
+        local_auto_layout = check_local_layout and is_local_edition() and pcfg.let_autolayout_flag
+        if local_auto_layout or review_job is not None and (pcfg.let_autolayout_flag or reviewed_page):
+            failed_blocks = [item.idx for item in self.st_manager.textblk_item_list if not self.st_manager.korean_layout_fits(item)]
+            if failed_blocks:
+                self._hold_local_layout(failed_blocks)
+                return False
 
         if restore_interface:
             set_canvas_focus = self.canvas.hasFocus()
@@ -1883,6 +1966,13 @@ class MainWindow(mainwindow_cls):
             output_dir = getattr(self, '_local_output_dir', None)
             if output_dir is not None and Path(imsave_path).parent.resolve() != output_dir.resolve():
                 self.imsave_thread.saveImg(str(output_dir / Path(imsave_path).name), img, self.imgtrans_proj.current_img, save_params={'ext': pcfg.imgsave_ext, 'quality': pcfg.imgsave_quality}, keep_alpha=self.imgtrans_proj.current_has_alpha())
+            if saved and reviewed_page:
+                review_pages = review_job['review_pages']
+                review_job['review_pages'] = [page for page in review_pages if page != self.imgtrans_proj.current_img]
+                if not workspace.save_queue():
+                    review_job['review_pages'] = review_pages
+                    self._local_save_error = '말풍선 확인 상태를 저장하지 못했습니다.'
+                    saved = False
             if saved:
                 self.canvas.setProjSaveState(False)
                 self.canvas.update_saved_undostep()
@@ -2292,6 +2382,10 @@ class MainWindow(mainwindow_cls):
 
         if page_index != self.pageList.currentIndex().row():
             self.pageList.setCurrentRow(page_index)
+            if self.pageList.currentIndex().row() != page_index:
+                self._local_save_error = getattr(self, '_local_save_error', '') or '페이지 전환 전 저장을 완료하지 못했습니다.'
+                self.module_manager.stopImgtransPipeline()
+                return
         else:
             self.imgtrans_proj.set_current_img_byidx(page_index)
             self.canvas.updateCanvas()
@@ -2305,6 +2399,12 @@ class MainWindow(mainwindow_cls):
             self.st_manager.auto_textlayout_flag = False
 
         self.llmContextEditor.refresh_context()
+
+        workspace = getattr(self, 'local_workspace', None)
+        local_layout = is_local_edition() or workspace is not None and self._local_layout_review_job() is not None
+        if local_layout and self.st_manager.auto_layout_failed:
+            self._hold_local_layout(self.st_manager.auto_layout_failed)
+            return
 
         # save proj file on page trans finished
         try:

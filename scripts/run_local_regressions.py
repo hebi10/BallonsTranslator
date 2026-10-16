@@ -10,6 +10,8 @@ TEST_FILES = (
     'tests/test_local_edition.py',
     'tests/test_local_ollama.py',
     'tests/test_local_workspace.py',
+    'tests/test_korean_segmentation.py',
+    'tests/test_korean_layout.py',
     'tests/test_pipeline_resume.py',
     'tests/test_llm_translation_contract.py',
     'tests/test_llm_chat.py',
