@@ -96,7 +96,7 @@ jobs:
           path = pathlib.Path('ballontranslator/ui/result_reader.py')
           text = path.read_text(encoding='utf-8')
           old = "                  f'{scope} QGroupBox, {scope} QCheckBox {{ color: #ededed; }}')"
-          new = "                  f'{scope} QGroupBox, {scope} QCheckBox {{ color: #ededed; }}'\n                  f'{scope} QWidget#ReaderExportSurface, {scope} QWidget#ReaderExportSurface QGroupBox '\n                  '{{ background: #191919; }}')"
+          new = "                  f'{scope} QGroupBox, {scope} QCheckBox {{ color: #ededed; }}'\n                  f'{scope} QWidget#ReaderExportSurface, {scope} QWidget#ReaderExportSurface QGroupBox '\n                  '{ background: #191919; }')"
           assert text.count(old)==1
           path.write_bytes(text.replace(old,new,1).encode('utf-8'))
           path = pathlib.Path('ballontranslator/ui/image_merge_dialog.py')
