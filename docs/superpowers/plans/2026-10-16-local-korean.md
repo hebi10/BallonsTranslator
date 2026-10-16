@@ -69,5 +69,8 @@ Files: scripts/install_local.ps1, scripts/start_local.ps1, scripts/build_local_p
 
 - [x] Run relevant tests, full suite, py_compile, git diff --check, UI render.
 - [x] Independently review changes, fix significant issues and rerun affected tests.
-- [ ] Push a dedicated branch and draft PR using GitHub connector; provide ZIP and exact setup instructions.
+- [x] Push a dedicated branch and draft PR using GitHub connector; provide ZIP and exact setup instructions.
+
+Delivery: https://github.com/hebi10/BallonsTranslator/pull/1
+Installation and verification limits: `doc/LOCAL_WINDOWS.md`, `doc/LOCAL_VERIFICATION.md`.
 

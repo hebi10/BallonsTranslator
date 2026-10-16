@@ -19,3 +19,5 @@ if ($env:OLLAMA_NO_CLOUD -ne '1' -or $env:OLLAMA_HOST -ne '127.0.0.1:11435') { t
 if ($env:PYTHONUTF8 -ne '1' -or $env:PYTHONNOUSERSITE -ne '1') { throw 'Python isolation environment is incorrect.' }
 if ($env:HF_HUB_OFFLINE -ne '1' -or $env:TRANSFORMERS_OFFLINE -ne '1') { throw 'Model loading is not offline.' }
 Write-Host 'Windows script parsing and native-exit/environment checks passed.'
+# GitHub Actions propagates LASTEXITCODE; the expected exit-23 probe must not leak.
+exit 0

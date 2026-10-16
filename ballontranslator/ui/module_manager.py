@@ -169,6 +169,29 @@ def _mark_translation_finished(
     translator.on_page_translation_finished(project, page_key)
 
 
+def _pending_pipeline_stages(project: ProjImgTrans, pages: List[str], continue_mode: bool) -> int:
+    """Include stages invalidated by pending detection or OCR during resume."""
+    enabled = sum(code for active, code in (
+        (cfg_module.enable_detect, RunStatus.FIN_DET),
+        (cfg_module.enable_ocr, RunStatus.FIN_OCR),
+        (cfg_module.enable_translate, RunStatus.FIN_TRANSLATE),
+        (cfg_module.enable_inpaint, RunStatus.FIN_INPAINT),
+    ) if active)
+    if not continue_mode:
+        return enabled if pages else 0
+    pending = 0
+    for page in pages:
+        page_pending = sum(code for code in (
+            RunStatus.FIN_DET, RunStatus.FIN_OCR, RunStatus.FIN_TRANSLATE, RunStatus.FIN_INPAINT,
+        ) if enabled & code and not project.page_stage_finished(page, code))
+        if page_pending & RunStatus.FIN_DET:
+            page_pending |= enabled
+        elif page_pending & RunStatus.FIN_OCR:
+            page_pending |= enabled & (RunStatus.FIN_TRANSLATE | RunStatus.FIN_INPAINT)
+        pending |= page_pending
+    return pending
+
+
 class ModuleThread(QThread):
     """Worker thread that prepares and swaps one lazily selected module.
 
@@ -249,6 +272,15 @@ class ModuleThread(QThread):
             if same_module and old_module.all_model_loaded():
                 self.last_set_success = True
                 return
+            from ballontranslator.utils.local_edition import is_local_edition
+            if self.module_key in {'textdetector', 'ocr', 'inpainter'} and is_local_edition():
+                from ballontranslator.utils.local_ollama import OllamaClient, LocalOperationCancelled
+                try:
+                    # This method runs on the preparation worker, before any
+                    # image-model constructor can allocate device memory.
+                    OllamaClient().unload(stop_event=self.cancel_event)
+                except LocalOperationCancelled as error:
+                    raise DownloadCancelled(str(error)) from error
             module: Union[TextDetectorBase, BaseTranslator, InpainterBase, OCRBase] = self._prepare_module_class(module_name)
             if same_module:
                 new_module = old_module
@@ -1105,6 +1137,17 @@ class ImgtransThread(QThread):
             for i in range(num_pages):
                 self.process_idx_to_page_idx[i] = i
             LOGGER.info(f'Processing all {num_pages} pages')
+        image_stages = RunStatus.FIN_DET | RunStatus.FIN_OCR | RunStatus.FIN_INPAINT
+        if _pending_pipeline_stages(self.imgtrans_proj, pages_to_iterate, self.continue_mode) & image_stages:
+            from ballontranslator.utils.local_edition import is_local_edition
+            if is_local_edition():
+                from ballontranslator.utils.local_ollama import OllamaClient, LocalOperationCancelled
+                try:
+                    # Also cover reused image modules after a setup translation
+                    # test. Once per job, never between translated pages.
+                    OllamaClient().unload(stop_event=self.stop_event)
+                except LocalOperationCancelled as error:
+                    raise LLMRequestStopped(str(error)) from error
         if cfg_module.enable_translate and self.translator is not None:
             describe_run = getattr(
                 self.translator,
@@ -2163,14 +2206,16 @@ class ModuleManager(QObject):
             self.imgtrans_pipeline_finished.emit()
             return
 
+        pages = list(pages_to_process or self.imgtrans_proj.pages)
+        pending = _pending_pipeline_stages(self.imgtrans_proj, pages, continue_mode)
         required_modules = []
-        if cfg_module.enable_detect:
+        if pending & RunStatus.FIN_DET:
             required_modules.append(('textdetector', cfg_module.textdetector))
-        if cfg_module.enable_ocr:
+        if pending & RunStatus.FIN_OCR:
             required_modules.append(('ocr', cfg_module.ocr))
-        if cfg_module.enable_translate:
+        if pending & RunStatus.FIN_TRANSLATE:
             required_modules.append(('translator', cfg_module.translator))
-        if cfg_module.enable_inpaint:
+        if pending & RunStatus.FIN_INPAINT:
             required_modules.append(('inpainter', cfg_module.inpainter))
         self._prepare_modules_then(
             required_modules,

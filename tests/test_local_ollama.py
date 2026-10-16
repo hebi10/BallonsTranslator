@@ -39,6 +39,9 @@ def server(monkeypatch):
                 return
             if self.path == '/api/pull':
                 items = [{'status': 'downloading', 'total': 100, 'completed': 50}, {'status': 'success'}]
+            elif body.get('keep_alive') == 0:
+                items = [{'model': local_ollama.MODEL_TAG, 'message': {'role': 'assistant', 'content': ''},
+                          'done': True, 'done_reason': state.get('unload_reason', 'unload')}]
             else:
                 items = [{'message': {'content': state.get('reply', '{"translation":"안녕하세요"}')}},
                          {'done': True, 'done_reason': 'stop', 'eval_count': 4}]
@@ -120,6 +123,16 @@ def test_model_load_test_checks_actual_korean_output(server):
     assert local_ollama.OllamaClient().test_translation() == '안녕하세요'
 
 
+def test_unload_requires_native_acknowledgement_and_fixed_model(server):
+    local_ollama.OllamaClient().unload()
+    assert server['requests'] == [('/api/chat', {
+        'model': local_ollama.MODEL_TAG, 'messages': [], 'keep_alive': 0, 'stream': False,
+    })]
+    server['unload_reason'] = 'stop'
+    with pytest.raises(RuntimeError, match='해제'):
+        local_ollama.OllamaClient().unload()
+
+
 def test_oversized_context_fails_before_silent_truncation(server):
     with pytest.raises(local_ollama.LocalContextTooLong):
         local_ollama.OllamaClient().chat({
@@ -152,14 +165,15 @@ def test_existing_translator_contract_reaches_native_ollama(server, monkeypatch)
     assert 'また明日' in body['messages'][-1]['content']
 
 
-def test_stalled_model_test_can_be_cancelled(server):
+@pytest.mark.parametrize('operation', ['test_translation', 'unload'])
+def test_stalled_model_test_can_be_cancelled(server, operation):
     server.update(stall=True, started=threading.Event(), release=threading.Event())
     stop = threading.Event()
     errors = []
 
     def request():
         try:
-            local_ollama.OllamaClient().test_translation(stop_event=stop)
+            getattr(local_ollama.OllamaClient(), operation)(stop_event=stop)
         except Exception as error:
             errors.append(error)
 

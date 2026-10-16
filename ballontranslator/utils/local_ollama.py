@@ -38,7 +38,8 @@ class OllamaClient:
 
     @contextmanager
     def _response(self, path: str, payload: Optional[dict] = None,
-                  stop_event: Optional[threading.Event] = None):
+                  stop_event: Optional[threading.Event] = None,
+                  read_timeout: Optional[float] = None):
         _check_cancel(stop_event)
         connection = http.client.HTTPConnection(OLLAMA_HOST, OLLAMA_PORT, timeout=5)
         finished = threading.Event()
@@ -62,7 +63,7 @@ class OllamaClient:
             connection.connect()
             transport_socket = connection.sock
             _check_cancel(stop_event)
-            connection.sock.settimeout(300 if payload is not None else 5)
+            connection.sock.settimeout(read_timeout if read_timeout is not None else (300 if payload is not None else 5))
             if stop_event is not None:
                 watcher = threading.Thread(target=cancel_socket, daemon=True)
                 watcher.start()
@@ -139,6 +140,23 @@ class OllamaClient:
         _check_cancel(stop_event)
         if not success:
             raise RuntimeError('모델 다운로드가 완료되지 않았습니다. 다시 설치하면 이어서 다운로드합니다.')
+
+    def unload(self, stop_event: Optional[threading.Event] = None) -> None:
+        """Wait for Ollama to release the translation model before image work.
+
+        The native chat API returns one object with done_reason="unload".
+        https://github.com/ollama/ollama/blob/main/docs/api.md#unload-a-model-1
+        """
+        payload = {'model': MODEL_TAG, 'messages': [], 'keep_alive': 0, 'stream': False}
+        with self._response('/api/chat', payload, stop_event, read_timeout=30) as response:
+            data = response.read(MAX_RESPONSE_BYTES + 1)
+            _check_cancel(stop_event)
+            if len(data) > MAX_RESPONSE_BYTES:
+                raise RuntimeError('Ollama 응답 크기가 제한을 초과했습니다.')
+            result = json.loads(data)
+            if (not isinstance(result, dict) or result.get('done') is not True
+                    or result.get('done_reason') != 'unload' or result.get('error')):
+                raise RuntimeError('번역 모델의 메모리 해제를 확인하지 못했습니다. Ollama를 다시 실행해 주세요.')
 
     def chat(self, api_args: Dict, stop_event: Optional[threading.Event] = None) -> dict:
         if api_args.get('model') != MODEL_TAG:

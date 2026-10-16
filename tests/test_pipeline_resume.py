@@ -10,6 +10,7 @@ from ballontranslator.modules.exceptions import LLMRequestStopped
 from ballontranslator.utils.config import RunStatus, pcfg
 from ballontranslator.utils.proj_imgtrans import ProjImgTrans
 from ballontranslator.utils.textblock import TextBlock
+from ballontranslator.utils import local_edition, local_ollama
 
 
 class Translator:
@@ -258,6 +259,95 @@ class PipelineResumeTest(unittest.TestCase):
         thread.run()
         self.assertTrue(thread.isStopRequested())
         self.assertEqual(stopped, [True])
+
+    def test_local_image_model_unloads_ollama_on_worker_before_constructor(self):
+        events = []
+        main_thread = threading.get_ident()
+
+        class ImageModel:
+            def __init__(self, **_kwargs):
+                events.append(('construct', threading.get_ident()))
+
+            def load_model(self):
+                events.append(('load', threading.get_ident()))
+
+        thread = module_manager.ModuleThread('ocr', None)
+        self.addCleanup(thread.deleteLater)
+        thread.job = lambda: thread._set_module('manga_ocr')
+        with patch.object(local_edition, '_active', True), patch.object(
+            local_ollama.OllamaClient, 'unload', create=True,
+            side_effect=lambda **_: events.append(('unload', threading.get_ident())),
+        ), patch.object(thread, '_prepare_module_class', return_value=ImageModel):
+            thread.start()
+            self.assertTrue(thread.wait(3000))
+        self.assertTrue(thread.last_set_success, thread.last_error)
+        self.assertEqual([name for name, _ in events], ['unload', 'construct', 'load'])
+        self.assertTrue(all(ident != main_thread for _, ident in events))
+
+    def test_local_pipeline_unloads_once_before_image_work_across_pages(self):
+        project = self.project()
+        project.pages['two.png'] = [TextBlock(xyxy=[0, 0, 8, 8], text=['second'])]
+        project._image_info['two.png'] = {'finish_code': 0}
+        translator = Translator()
+        translator.low_vram_mode = True
+        thread = self.pipeline(project, translator)
+        with patch.object(local_edition, '_active', True), patch.object(
+            local_ollama.OllamaClient, 'unload', create=True,
+            side_effect=lambda **_: self.events.append('unload Ollama'),
+        ), patch.object(module_manager, 'unload_modules'):
+            thread._imgtrans_pipeline()
+        self.assertEqual(self.events[0], 'unload Ollama')
+        self.assertEqual(self.events.count('unload Ollama'), 1)
+        self.assertEqual(translator.calls, ['one.png', 'two.png'])
+
+    def test_translation_only_resume_skips_image_preparation_and_ollama_unload(self):
+        project = self.project(RunStatus.FIN_DET | RunStatus.FIN_OCR | RunStatus.FIN_INPAINT)
+        manager = module_manager.ModuleManager(project)
+        self.addCleanup(manager.deleteLater)
+        prepared = []
+        with patch.object(manager, 'terminateRunningThread'), patch.object(
+            manager, '_prepare_modules_then', side_effect=lambda required, *_args, **_kwargs: prepared.extend(required),
+        ):
+            manager.runImgtransPipeline(['one.png'], continue_mode=True)
+        self.assertEqual(prepared, [('translator', pcfg.module.translator)])
+        translator = Translator()
+        translator.low_vram_mode = True
+        thread = self.pipeline(project, translator)
+        thread.continue_mode = True
+        with patch.object(local_edition, '_active', True), patch.object(
+            local_ollama.OllamaClient, 'unload', create=True,
+            side_effect=AssertionError('No image work must keep the translation model resident'),
+        ), patch.object(module_manager, 'unload_modules'):
+            thread._imgtrans_pipeline()
+        self.assertEqual(translator.calls, ['one.png'])
+
+    def test_unload_failure_prevents_image_model_preparation(self):
+        thread = module_manager.ModuleThread('ocr', SimpleNamespace(get_spec=lambda _: None))
+        self.addCleanup(thread.deleteLater)
+        with patch.object(local_edition, '_active', True), patch.object(
+            local_ollama.OllamaClient, 'unload', side_effect=RuntimeError('release failed'),
+        ), patch.object(thread, '_prepare_module_class', side_effect=AssertionError('must not load')):
+            thread._set_module('manga_ocr')
+        self.assertFalse(thread.last_set_success)
+        self.assertEqual(str(thread.last_error), 'release failed')
+        self.assertIsNone(thread.module)
+
+    def test_resume_prepares_dependencies_invalidated_by_pending_ocr(self):
+        project = self.project(RunStatus.FIN_DET | RunStatus.FIN_TRANSLATE | RunStatus.FIN_INPAINT)
+        manager = module_manager.ModuleManager(project)
+        self.addCleanup(manager.deleteLater)
+        prepared = []
+        with patch.object(manager, 'terminateRunningThread'), patch.object(
+            manager, '_prepare_modules_then', side_effect=lambda required, *_args, **_kwargs: prepared.extend(required),
+        ):
+            manager.runImgtransPipeline(['one.png'], continue_mode=True)
+            self.assertEqual([kind for kind, _ in prepared], ['ocr', 'translator', 'inpainter'])
+            prepared.clear()
+            manager.runImgtransPipeline(['one.png'], continue_mode=False)
+            self.assertEqual([kind for kind, _ in prepared], ['textdetector', 'ocr', 'translator', 'inpainter'])
+            prepared.clear()
+            manager.runImgtransPipeline([], continue_mode=False)
+            self.assertEqual([kind for kind, _ in prepared], ['textdetector', 'ocr', 'translator', 'inpainter'])
 
 
 if __name__ == '__main__':
