@@ -1,0 +1,88 @@
+name: Publish local Windows v0.1.0
+
+on:
+  push:
+    branches: ['release/local-v0.1.0']
+    paths: ['.github/workflows/publish-local-v0.1.0.yml']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-local-v0.1.0
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      actions: read
+    env:
+      SOURCE_SHA: 30d89434d021ca2873b97c7ab5614ed5cee87495
+      VALIDATED_RUN: '38856099623'
+      RELEASE_TAG: local-v0.1.0
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify the Windows-tested source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          result=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$VALIDATED_RUN" --jq '.head_sha + " " + .conclusion + " " + .path')
+          test "$result" = "$SOURCE_SHA success .github/workflows/local-windows.yml"
+          existing=$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$RELEASE_TAG" --jq 'length')
+          test "$existing" = 0
+      - name: Build source and bootstrap ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/build_local_package.py --output release/BallonsTranslator-Local-Windows-source.zip
+          python -m zipfile -t release/BallonsTranslator-Local-Windows-source.zip
+          cd release
+          sha256sum BallonsTranslator-Local-Windows-source.zip > SHA256SUMS.txt
+      - name: Write release notes
+        shell: bash
+        run: |
+          cat > release/RELEASE_NOTES.md <<'NOTES'
+          일본어 만화를 한국어로 번역하는 Windows 로컬판의 첫 테스트 배포입니다.
+
+          ### 변경 내용
+          - 사각형으로 선택한 영역만 OCR·번역·LaMa 배경 복원·한국어 배치 재작업
+          - 선택 영역 밖 대사·이미지 보존 및 Ctrl+Z 한 번으로 재작업 되돌리기
+          - 말풍선 분리, 페이지 문맥·이미지 참고 번역, 한국어 자동 조판
+
+          ### 설치
+          1. Assets의 `BallonsTranslator-Local-Windows-source.zip`을 다운로드하고 쓰기 가능한 폴더에 압축을 풉니다.
+          2. 압축을 푼 폴더의 `launch_local.bat`를 실행합니다.
+          3. 필요한 Ollama 설치를 완료하고 앱 준비 화면에서 이미지 처리 모델과 번역 모델을 다운로드합니다.
+
+          영역 재작업: **Ctrl+Shift+R → 사각형 선택 → 선택 영역 재작업**.
+
+          ### 배포 및 검증 범위
+          - Windows용 소스·설치 런처 ZIP입니다. APK·단독 EXE·모델 가중치는 포함하지 않습니다.
+          - 최초 설치에는 인터넷이 필요합니다. 기본 Qwen3.5 9B Q4_K_M 번역 모델은 약 6.6GB이며 실행 환경과 OCR·복원 모델 공간이 추가로 필요합니다.
+          - 해당 소스의 Windows 자동 검사(설치 스크립트·컴파일·30개 회귀 파일·Qt5 검사·패키지 생성)가 통과했습니다.
+          - 실제 사용자 PC의 GPU 추론·속도·번역 품질과 완전 오프라인 실행은 별도 검증이 필요합니다. 복잡한 그림의 정확한 원상 복원은 보장하지 않습니다.
+
+          [설치 안내](https://github.com/hebi10/BallonsTranslator/blob/30d89434d021ca2873b97c7ab5614ed5cee87495/doc/LOCAL_WINDOWS.md) · [Windows 검사](https://github.com/hebi10/BallonsTranslator/actions/runs/38856099623)
+          NOTES
+      - name: Publish the verified package
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "$RELEASE_TAG" release/BallonsTranslator-Local-Windows-source.zip release/SHA256SUMS.txt \
+            --repo "$GITHUB_REPOSITORY" --target "$SOURCE_SHA" --draft --prerelease \
+            --title 'Windows 로컬 번역판 v0.1.0 · 선택 영역 재작업' --notes-file release/RELEASE_NOTES.md
+          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease --latest=false
