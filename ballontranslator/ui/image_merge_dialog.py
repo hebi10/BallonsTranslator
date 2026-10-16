@@ -9,7 +9,7 @@ from qtpy.QtGui import QDesktopServices, QImage, QPixmap
 from qtpy.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout,
     QGroupBox, QHBoxLayout, QLineEdit, QListWidget, QListWidgetItem, QPushButton,
-    QProgressBar, QSpinBox, QSplitter, QVBoxLayout, QWidget, QSizePolicy,
+    QProgressBar, QSpinBox, QSplitter, QVBoxLayout, QWidget, QSizePolicy, QScrollArea, QFrame, QLayout,
 )
 
 from ballontranslator.utils.reader_export import (
@@ -90,8 +90,15 @@ class ImageMergeDialog(QDialog):
         for button in (self.up_button, self.down_button, self.reverse_button):
             order.addWidget(button)
         left_layout.addLayout(order)
-        right = QWidget(split); right_layout = QVBoxLayout(right); right_layout.setContentsMargins(0, 0, 0, 0)
+        right_scroll = QScrollArea(split)
+        right_scroll.setWidgetResizable(True); right_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        right = QWidget(); right_layout = QVBoxLayout(right); right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+        right_scroll.setWidget(right)
         options = QGroupBox('2  방향·크기', right); form = QFormLayout(options)
+        form.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+        form.setVerticalSpacing(8)
+        options.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         self.direction_combo = QComboBox(options)
         self.direction_combo.addItem('세로 · 위에서 아래로', 'vertical')
@@ -120,7 +127,7 @@ class ImageMergeDialog(QDialog):
         self.preview_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         self.preview_label.setMinimumHeight(130)
         right_layout.addWidget(self.preview_label, 1)
-        split.addWidget(left); split.addWidget(right); split.setSizes([290, 720]); split.setStretchFactor(1, 1)
+        split.addWidget(left); split.addWidget(right_scroll); split.setSizes([290, 720]); split.setStretchFactor(1, 1)
         split.setChildrenCollapsible(False)
         root.addWidget(split, 1)
         self.summary_label = plain_label('', self); root.addWidget(self.summary_label)

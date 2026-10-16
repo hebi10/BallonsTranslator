@@ -199,3 +199,35 @@ def test_fullscreen_close_shuts_down_loader(app, book, tmp_path):
     d = ReaderDialog(book, ReaderHistory(tmp_path / 'h.json'))
     d.show(); d.toggle_fullscreen(); app.processEvents()
     close_reader(app, d)
+
+
+def test_workspace_owned_reader_and_small_export_are_readable(app, book, tmp_path):
+    from ballontranslator.ui.local_workspace import LocalWorkspace
+    from qtpy.QtGui import QPalette
+    owner = LocalWorkspace(queue_path=tmp_path / 'jobs.json')
+    owner.show(); app.processEvents()
+    root = Path(os.environ.get('READER_SCREENSHOT_DIR', str(tmp_path)))
+    root.mkdir(parents=True, exist_ok=True)
+    reader = ReaderDialog(book, ReaderHistory(tmp_path / 'h.json'), owner)
+    try:
+        reader.resize(1000, 720); reader.show()
+        until(app, lambda: bool(reader.canvas.cache))
+        background = reader.palette().color(QPalette.ColorRole.Window).lightness()
+        foreground = reader.notice.palette().color(QPalette.ColorRole.WindowText).lightness()
+        assert abs(background - foreground) >= 100, (background, foreground)
+        assert reader.grab().save(str(root / 'reader-workspace.png'))
+    finally:
+        close_reader(app, reader)
+    merge = ImageMergeDialog(book, owner)
+    try:
+        merge.resize(800, 620); merge.show()
+        until(app, lambda: merge.preview_ready)
+        assert merge.direction_combo.geometry().bottom() < merge.cross_spin.geometry().top()
+        assert merge.cross_spin.geometry().bottom() < merge.gap_spin.geometry().top()
+        assert merge.length_spin.geometry().bottom() < merge.format_combo.geometry().top()
+        assert merge.export_button.isVisible()
+        assert merge.grab().save(str(root / 'image-export-workspace-small.png'))
+    finally:
+        close_merge(app, merge)
+        owner.close(); owner.deleteLater(); app.processEvents()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)

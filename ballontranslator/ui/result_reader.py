@@ -34,6 +34,16 @@ def action_button(text: str, slot, parent=None) -> QPushButton:
 
 
 def size_dialog(dialog: QDialog, width: int, height: int) -> None:
+    owner = dialog.parentWidget()
+    while owner is not None and owner.objectName() != 'LocalWorkspace':
+        owner = owner.parentWidget()
+    if owner is not None:
+        scope = f'QDialog#{dialog.objectName()}'
+        style = owner.styleSheet().replace('LocalWorkspace', dialog.objectName())
+        style += (f'{scope} QListWidget, {scope} QSpinBox {{ background: #242424; color: #ededed; '
+                  'border: 1px solid #555555; selection-background-color: #505050; }'
+                  f'{scope} QGroupBox, {scope} QCheckBox {{ color: #ededed; }}')
+        dialog.setStyleSheet(style)
     screen = QApplication.primaryScreen()
     available = screen.availableGeometry() if screen else QRect(0, 0, width + 32, height + 32)
     dialog.resize(min(width, available.width() - 32), min(height, available.height() - 48))
