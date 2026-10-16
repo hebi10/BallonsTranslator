@@ -1,5 +1,7 @@
 """Native transport for the one model served by the private local runtime."""
 
+import base64
+import binascii
 import http.client
 import io
 import json
@@ -7,14 +9,21 @@ import re
 import select
 import threading
 import time
+import warnings
 from contextlib import contextmanager
 from functools import partial
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 MODEL_TAG = 'qwen3.5:9b-q4_K_M'
 OLLAMA_HOST = '127.0.0.1'
 OLLAMA_PORT = 11435
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+MAX_IMAGE_DIMENSION = 1024
+MAX_IMAGE_BYTES = 2 * 1024 * 1024
+MAX_IMAGE_BASE64_BYTES = 4 * ((MAX_IMAGE_BYTES + 2) // 3)
+# This is a conservative allowance, not a model-specific image-token estimate.
+# Keep image pixels and output bounded within the existing local 8192 context.
+VISION_CONTEXT_RESERVE = 2048
 
 
 class LocalOperationCancelled(RuntimeError):
@@ -28,6 +37,115 @@ class LocalContextTooLong(RuntimeError):
 def _check_cancel(stop_event: Optional[threading.Event]) -> None:
     if stop_event is not None and stop_event.is_set():
         raise LocalOperationCancelled('작업이 중단되었습니다. 완료한 작업은 보존됩니다.')
+
+
+def _native_image_data(image_url: object) -> str:
+    """Validate one in-memory app image; never resolve a URL or file path."""
+    if not isinstance(image_url, dict):
+        raise ValueError('이미지 URL은 인라인 JPEG/PNG 데이터여야 합니다.')
+    url = image_url.get('url')
+    if not isinstance(url, str):
+        raise ValueError('이미지 URL은 인라인 JPEG/PNG 데이터여야 합니다.')
+    header, separator, encoded = url.partition(',')
+    formats = {'data:image/jpeg;base64': 'JPEG', 'data:image/png;base64': 'PNG'}
+    if not separator or header not in formats or not encoded:
+        raise ValueError('이미지는 인라인 JPEG/PNG 데이터만 사용할 수 있습니다. 외부 URL과 파일 경로는 지원하지 않습니다.')
+    if len(encoded) > MAX_IMAGE_BASE64_BYTES:
+        raise ValueError('이미지 데이터가 로컬 모델의 2 MiB 제한을 초과했습니다.')
+    try:
+        decoded = base64.b64decode(encoded, validate=True)
+    except (ValueError, binascii.Error) as error:
+        raise ValueError('이미지의 base64 데이터가 올바르지 않습니다.') from error
+    if len(decoded) > MAX_IMAGE_BYTES:
+        raise ValueError('이미지 데이터가 로컬 모델의 2 MiB 제한을 초과했습니다.')
+
+    # Pillow is already required for project images. Read only memory here, and
+    # check the header dimensions before allocating the decompressed pixels.
+    from PIL import Image
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter('error', Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(decoded), formats=('JPEG', 'PNG')) as image:
+                if image.format != formats[header]:
+                    raise ValueError('이미지 MIME 형식과 실제 데이터가 일치하지 않습니다.')
+                if min(image.size) < 1 or max(image.size) > MAX_IMAGE_DIMENSION:
+                    raise ValueError(f'이미지의 긴 변은 {MAX_IMAGE_DIMENSION}px 이하여야 합니다.')
+                image.verify()
+            with Image.open(io.BytesIO(decoded), formats=('JPEG', 'PNG')) as image:
+                image.load()
+    except (OSError, SyntaxError, ValueError, Image.DecompressionBombError,
+            Image.DecompressionBombWarning) as error:
+        raise ValueError(f'이미지 데이터가 올바르지 않거나 크기 제한을 초과했습니다: {error}') from error
+    return encoded
+
+
+def _native_messages(messages: object) -> Tuple[List[dict], int]:
+    """Convert inline content without mutating messages or merging page images.
+
+    Ollama attaches images to a message rather than an inline text position.
+    Text parts retain their order; the current page is the only allowed image.
+
+    >>> _native_messages([{'role': 'user', 'content': 'hello'}])
+    ([{'role': 'user', 'content': 'hello'}], 0)
+    """
+    if not isinstance(messages, list):
+        raise ValueError('로컬 모델의 messages는 메시지 목록이어야 합니다.')
+    native, image_count = [], 0
+    for message in messages:
+        if not isinstance(message, dict):
+            raise ValueError('로컬 모델의 메시지 형식이 올바르지 않습니다.')
+        if 'images' in message:
+            raise ValueError('이미지는 인라인 JPEG/PNG 콘텐츠로 전달해야 합니다.')
+        content = message.get('content')
+        converted = dict(message)
+        if isinstance(content, str):
+            native.append(converted)
+            continue
+        if not isinstance(content, list):
+            raise ValueError('로컬 모델의 콘텐츠는 텍스트 또는 텍스트/이미지 목록이어야 합니다.')
+        text_parts, images = [], []
+        for part in content:
+            if not isinstance(part, dict):
+                raise ValueError('로컬 모델의 콘텐츠 항목 형식이 올바르지 않습니다.')
+            if part.get('type') == 'text' and isinstance(part.get('text'), str):
+                text_parts.append(part['text'])
+            elif part.get('type') == 'image_url':
+                image_count += 1
+                if image_count > 1:
+                    raise ValueError('로컬 모델 요청에는 페이지 또는 영역 이미지 한 장만 첨부할 수 있습니다.')
+                images.append(_native_image_data(part.get('image_url')))
+            else:
+                raise ValueError('로컬 모델은 텍스트와 인라인 JPEG/PNG 이미지만 지원합니다.')
+        converted['content'] = ''.join(text_parts)
+        if images:
+            converted['images'] = images
+        native.append(converted)
+    return native, image_count
+
+
+def _runtime_error(detail: str, payload: Optional[dict]) -> RuntimeError:
+    """Explain image/runtime failures while retaining the server diagnostic."""
+    has_image = payload is not None and any(
+        message.get('images') for message in payload.get('messages', [])
+    )
+    if not has_image:
+        return RuntimeError(detail)
+    lowered = detail.lower()
+    if any(phrase in lowered for phrase in ('context length', 'context window', 'prompt is too long')):
+        return LocalContextTooLong(f'이미지와 대사의 문맥이 로컬 모델 예산을 초과했습니다. {detail}')
+    if any(phrase in lowered for phrase in (
+        'out of memory', 'not enough memory', 'requires more system memory',
+        'failed to allocate', 'unable to allocate',
+    )):
+        return RuntimeError(f'이미지 번역 중 메모리가 부족합니다. 다른 GPU 작업을 종료하거나 준비 화면의 이미지 문맥 자동 확인을 끄고 다시 시도해 주세요. {detail}')
+    if any(phrase in lowered for phrase in (
+        'does not support images', 'does not support image input', 'does not support vision',
+        'image input is not supported', 'vision is not supported',
+    )):
+        return RuntimeError(f'현재 Ollama 실행기가 이 모델의 이미지 입력을 지원하지 않습니다. 로컬 Ollama 버전을 확인해 주세요. {detail}')
+    if any(phrase in lowered for phrase in ('unknown model architecture', 'requires a newer version')):
+        return RuntimeError(f'현재 Ollama 버전에서 이미지 모델을 실행하지 못했습니다. 로컬 실행기 업데이트를 확인해 주세요. {detail}')
+    return RuntimeError(detail)
 
 
 class _CancellableReader(io.RawIOBase):
@@ -104,7 +222,7 @@ class OllamaClient:
             if response.status != 200:
                 # Never follow a Location header, even if it points to another local service.
                 detail = response.read(4096).decode('utf-8', errors='replace')
-                raise RuntimeError(f'Ollama 오류 ({response.status}): {detail[:800]}')
+                raise _runtime_error(f'Ollama 오류 ({response.status}): {detail[:800]}', payload)
             yield response
             _check_cancel(stop_event)
         except (OSError, http.client.HTTPException) as error:
@@ -154,7 +272,7 @@ class OllamaClient:
                 if not isinstance(item, dict):
                     raise RuntimeError('Ollama 응답 형식이 올바르지 않습니다.')
                 if item.get('error'):
-                    raise RuntimeError(f'Ollama: {str(item["error"])[:800]}')
+                    raise _runtime_error(f'Ollama: {str(item["error"])[:800]}', payload)
                 yield item
 
     def pull(self, progress: Callable[[str], None], stop_event: threading.Event) -> None:
@@ -192,11 +310,14 @@ class OllamaClient:
             raise ValueError('로컬 전용 번역 모델만 사용할 수 있습니다.')
         response_format = api_args.get('response_format', {})
         schema = response_format.get('json_schema', {}).get('schema') or 'json'
-        messages = api_args.get('messages', [])
-        # UTF-8 bytes are a conservative upper bound for byte-fallback tokenizers.
-        # Reserve output and template overhead rather than let Ollama drop page text.
-        prompt_bytes = len(json.dumps(messages, ensure_ascii=False).encode('utf-8'))
-        if prompt_bytes + 512 > 8192 - 2048:
+        _check_cancel(stop_event)
+        messages, image_count = _native_messages(api_args.get('messages', []))
+        # Base64 is transport data, not prompt text. Account for text separately
+        # and reserve bounded visual context instead of counting encoded bytes.
+        text_messages = [{key: value for key, value in message.items() if key != 'images'}
+                         for message in messages]
+        prompt_bytes = len(json.dumps(text_messages, ensure_ascii=False).encode('utf-8'))
+        if prompt_bytes + 512 + image_count * VISION_CONTEXT_RESERVE > 8192 - 2048:
             raise LocalContextTooLong('문맥이 로컬 모델 예산을 초과했습니다. 대사를 나누어 처리해 주세요.')
         payload = {
             'model': MODEL_TAG,

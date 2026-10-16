@@ -300,8 +300,10 @@ class BaseTranslator(BaseModule):
                         or id(block) in selected_blocks
                         for block in page
                     )
-            _translations = self.translate(
+            _translations = self._translate_prepared_textblocks(
                 text_list,
+                textblk_lst=textblk_lst,
+                non_empty_ids=non_empty_ids,
                 project=project,
                 page_key=page_key,
                 commit_history_window=commit_history_window,
@@ -324,6 +326,28 @@ class BaseTranslator(BaseModule):
 
         for tr, blk in zip(translations, textblk_lst):
             blk.translation = tr
+
+    def _translate_prepared_textblocks(
+        self,
+        text_list: List[str],
+        *,
+        textblk_lst: List[TextBlock],
+        non_empty_ids: List[int],
+        project: Optional['ProjImgTrans'],
+        page_key: Optional[str],
+        commit_history_window: bool,
+    ) -> List[str]:
+        """Dispatch prepared sources without adding keywords to public translators.
+
+        Block-aware translators can freeze geometry here using the exact source
+        indices, including duplicate OCR and sources changed by substitutions.
+        """
+        return self.translate(
+            text_list,
+            project=project,
+            page_key=page_key,
+            commit_history_window=commit_history_window,
+        )
 
     def on_page_translation_finished(
         self,

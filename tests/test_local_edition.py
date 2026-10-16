@@ -19,7 +19,8 @@ def test_profile_is_fixed_local_and_does_not_mutate_existing_config_file(tmp_pat
     profile = config.module.llm_profiles[0]
     assert profile.model == local_edition.MODEL_TAG
     assert profile.base_url == 'http://127.0.0.1:11435/v1'
-    assert not profile.support_vision and not profile.support_image
+    assert profile.support_vision and not profile.support_image
+    assert config.module.local_visual_context and config.module.llm_translate_vision
     assert not config.check_update_on_startup
     assert old.read_text(encoding='utf-8') == '{"keep":"user settings"}'
 
@@ -32,6 +33,27 @@ def test_profile_keeps_user_glossary_and_prompt():
     local_edition.apply_local_profile(config)
     assert config.module.llm_glossary_path == 'my-terms.tsv'
     assert 'Character A' in config.module.llm_profiles[0].prompt
+
+
+def test_local_visual_context_preference_survives_config_reload_and_profile_refresh():
+    from ballontranslator.utils.config import ModuleConfig
+    config = ProgramConfig()
+    local_edition.apply_local_profile(config)
+    config.module.local_visual_context = False
+    config.module = ModuleConfig(**config.module.get_saving_params())
+    local_edition.apply_local_profile(config)
+    assert not config.module.local_visual_context
+    assert not config.module.llm_translate_vision
+    assert config.module.llm_profiles[0].support_vision
+
+
+def test_old_or_malformed_visual_context_setting_uses_safe_default():
+    from ballontranslator.utils.config import ModuleConfig
+    assert ModuleConfig().local_visual_context is True
+    with patch('ballontranslator.utils.config.LOGGER.warning') as warning:
+        restored = ModuleConfig(local_visual_context='false')
+    assert restored.local_visual_context is True
+    warning.assert_called()
 
 
 def test_local_catalog_contains_only_recommended_modules():

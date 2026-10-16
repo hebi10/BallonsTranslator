@@ -9,12 +9,13 @@ import threading
 from qtpy.QtCore import Qt, QThread, QUrl, Signal
 from qtpy.QtGui import QDesktopServices
 from qtpy.QtWidgets import (
-    QAbstractItemView, QComboBox, QDialog, QFileDialog, QFrame, QHBoxLayout,
+    QAbstractItemView, QCheckBox, QComboBox, QDialog, QFileDialog, QFrame, QHBoxLayout,
     QHeaderView, QLabel, QLineEdit, QPushButton, QProgressBar, QTableWidget,
     QTableWidgetItem, QVBoxLayout, QMessageBox,
 )
 
 from ballontranslator.utils import shared
+from ballontranslator.utils.config import pcfg, save_config
 from ballontranslator.utils.logger import logger as LOGGER
 
 
@@ -291,6 +292,19 @@ class LocalWorkspace(QDialog):
         self.format_combo.currentIndexChanged.connect(self.save_options)
         output_row.addWidget(self.format_combo)
         outer.addLayout(output_row)
+        context_row = QHBoxLayout()
+        self.visual_context_checkbox = QCheckBox(self)
+        self.visual_context_checkbox.setChecked(pcfg.module.local_visual_context)
+        context_label = QLabel(self.tr('이미지 문맥 자동 확인 · 길쭉하거나 가까이 붙은 대사'), self)
+        context_label.setWordWrap(True)
+        self.visual_context_checkbox.setAccessibleName(self.tr('이미지 문맥 자동 확인'))
+        tip = self.tr('기존 로컬 모델이 해당 페이지 이미지를 함께 참고합니다. 입력 한도를 넘으면 이미지 없이 대사·위치 문맥으로 전환하고 로그에 기록합니다. 시간이 더 걸리거나 메모리가 부족하면 끌 수 있습니다.')
+        self.visual_context_checkbox.setToolTip(tip)
+        context_label.setToolTip(tip)
+        self.visual_context_checkbox.toggled.connect(self.set_visual_context)
+        context_row.addWidget(self.visual_context_checkbox)
+        context_row.addWidget(context_label, 1)
+        outer.addLayout(context_row)
         self.progress = QProgressBar(self)
         self.progress.setMinimumHeight(24)
         self.progress.setRange(0, 100)
@@ -332,6 +346,7 @@ class LocalWorkspace(QDialog):
         idle = not self.busy
         for button in self.setup_buttons:
             button.setEnabled(idle)
+        self.visual_context_checkbox.setEnabled(idle)
         for widget in (self.add_button, self.remove_button, self.edit_button, self.output_edit,
                        self.output_button, self.format_combo, self.start_button, self.retry_button, self.restart_button):
             widget.setEnabled(idle and self.queue.writable)
@@ -460,6 +475,19 @@ class LocalWorkspace(QDialog):
         self.queue.output = self.output_edit.text().strip()
         self.queue.format = self.format_combo.currentData()
         self.save_queue()
+
+    def set_visual_context(self, enabled: bool) -> None:
+        if self.busy:
+            return
+        pcfg.module.local_visual_context = enabled
+        pcfg.module.llm_translate_vision = enabled
+        try:
+            saved = save_config()
+        except OSError as exc:
+            self.status_label.setText(self.tr('이미지 문맥 설정 저장 실패: ') + str(exc))
+            return
+        if saved is False:
+            self.status_label.setText(self.tr('이미지 문맥 설정을 저장하지 못했습니다. 이번 실행에는 적용됩니다.'))
 
     def save_queue(self) -> bool:
         try:

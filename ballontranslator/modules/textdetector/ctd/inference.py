@@ -14,6 +14,7 @@ from ballontranslator.utils.imgproc_utils import letterbox, xyxy2yolo, get_yolol
 from ..yolov5.yolov5_utils import non_max_suppression
 from ..db_utils import SegDetectorRepresenter
 from ballontranslator.utils.textblock import TextBlock, group_output, mit_merge_textlines
+from ballontranslator.utils.local_edition import is_local_edition
 from .textmask import refine_mask, refine_undetected_mask, REFINEMASK_INPAINT, REFINEMASK_ANNOTATION
 from pathlib import Path
 from typing import Union, List, Tuple, Callable
@@ -345,7 +346,10 @@ class TextDetector:
             lines = []
         else:
             lines = lines.astype(np.int64)
-        blk_list = group_output([], lines, im_w, im_h, mask, canvas=img)
+        blk_list = group_output(
+            [], lines, im_w, im_h, mask, canvas=img,
+            local_bubble_grouping=is_local_edition(),
+        )
         # print(lines)
         # blk_list = mit_merge_textlines(lines, im_w, im_w)
         mask_refined = refine_mask(img, mask, blk_list, refine_mode=refine_mode)

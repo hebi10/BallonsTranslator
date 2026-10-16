@@ -117,6 +117,22 @@ class LocalWorkspaceTest(unittest.TestCase):
         self.assertEqual(results, [])
         self.assertEqual(failures, ['offline'])
 
+    def test_visual_context_toggle_updates_and_persists_local_preference(self):
+        from ballontranslator.utils.config import pcfg
+        with patch.object(pcfg.module, 'local_visual_context', True), patch.object(
+            pcfg.module, 'llm_translate_vision', True,
+        ), patch('ballontranslator.ui.local_workspace.save_config') as save:
+            self.dialog.visual_context_checkbox.setChecked(False)
+            self.assertFalse(pcfg.module.local_visual_context)
+            self.assertFalse(pcfg.module.llm_translate_vision)
+            save.assert_called_once()
+            self.dialog.running = True
+            self.dialog.set_controls()
+            self.assertFalse(self.dialog.visual_context_checkbox.isEnabled())
+            restored = LocalWorkspace(queue_path=Path(self.tmp.name) / 'other.json')
+            self.addCleanup(restored.deleteLater)
+            self.assertFalse(restored.visual_context_checkbox.isChecked())
+
     def test_readiness_table_shows_all_rows_without_vertical_scrolling(self):
         self.dialog.worker = LocalSetupThread('status', self.dialog)
         self.dialog._last_operation = 'status'

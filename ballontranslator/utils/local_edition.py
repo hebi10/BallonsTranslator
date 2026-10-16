@@ -52,7 +52,7 @@ def apply_local_profile(config) -> None:
         id=LOCAL_PROFILE_ID, name='로컬 번역 · Qwen3.5 9B', backend='openai',
         base_url='http://127.0.0.1:11435/v1', require_api_key=False,
         model=MODEL_TAG, model_options=[MODEL_TAG], support_text=True,
-        support_vision=False, support_image=False, thinking_level=THINKING_DISABLED,
+        support_vision=True, support_image=False, thinking_level=THINKING_DISABLED,
         prompt=previous.prompt if previous else LOCAL_PROMPT,
         max_tokens=2048, temperature=0.2, json_schema_response_format=True,
     )
@@ -65,7 +65,8 @@ def apply_local_profile(config) -> None:
     module.translate_context = 'page'
     module.llm_translate_context = 'history'
     module.llm_prior_context_token_budget = 2048
-    module.llm_translate_vision = module.llm_translate_summary_memory = False
+    module.llm_translate_vision = module.local_visual_context
+    module.llm_translate_summary_memory = False
     module.ocr_font_detect = False
     module.empty_runcache = True
     config.check_update_on_startup = False
