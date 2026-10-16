@@ -90,7 +90,8 @@ class LocalJobQueue:
                 'resave': row.get('resave') is True or row.get('state') == 'running',
                 'review_pages': valid_review_pages,
                 'source_language': row.get('source_language', '日本語')
-                if row.get('source_language', '日本語') in LOCAL_SOURCE_OCR else '日本語',
+                if isinstance(row.get('source_language', '日本語'), str)
+                and row.get('source_language', '日本語') in LOCAL_SOURCE_OCR else '日本語',
             })
         if invalid:
             self.warning = f'작업 목록에서 잘못된 항목 {invalid}개를 제외했습니다.'
