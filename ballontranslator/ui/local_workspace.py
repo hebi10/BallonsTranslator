@@ -201,12 +201,16 @@ class LocalWorkspace(QDialog):
         self._worker_result = None
         self._worker_error = ''
         self._build_ui()
+        from .reader_tools import ReaderTools
+        self.reader_tools = ReaderTools(self, parent)
+        self.layout().insertWidget(self.layout().indexOf(self.table) + 2, self.reader_tools)
         self.refresh_queue()
         self.status_label.setText(self.queue.warning or '준비 상태 확인 → 폴더 추가 → 번역 시작 순서로 진행하세요.')
 
     @property
     def busy(self) -> bool:
-        return self.worker is not None or self.running
+        reader = getattr(self, 'reader_tools', None)
+        return self.worker is not None or self.running or (reader is not None and reader.busy)
 
     def _build_ui(self) -> None:
         outer = QVBoxLayout(self)
@@ -353,6 +357,8 @@ class LocalWorkspace(QDialog):
         self.pause_button.setEnabled(self.running and not self.pause_pending)
         self.cancel_button.setEnabled(self.worker is not None and self._last_operation != 'status')
         self.close_button.setEnabled(idle)
+        if getattr(self, 'reader_tools', None) is not None:
+            self.reader_tools.sync_state()
 
     def on_setup_clicked(self) -> None:
         self.start_setup(self.sender().property('operation'))

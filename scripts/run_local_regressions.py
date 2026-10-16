@@ -7,6 +7,8 @@ import sys
 
 
 TEST_FILES = (
+    'tests/test_reader_export.py',
+    'tests/test_result_reader_ui.py',
     'tests/test_local_edition.py',
     'tests/test_local_ollama.py',
     'tests/test_local_dialogue_context.py',
