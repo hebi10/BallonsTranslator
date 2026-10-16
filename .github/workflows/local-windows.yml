@@ -50,10 +50,10 @@ jobs:
         run: python -m unittest discover -s scripts/tests -v
       - name: Run local regression files in separate processes
         run: python scripts/run_local_regressions.py
-      - name: Verify Korean typesetting with Qt 5
+      - name: Verify Korean typesetting and region rework with Qt 5
         env:
           QT_API: pyqt5
-        run: python scripts/run_local_regressions.py --files tests/test_korean_segmentation.py tests/test_korean_layout.py tests/test_local_workspace.py
+        run: python scripts/run_local_regressions.py --files tests/test_korean_segmentation.py tests/test_korean_layout.py tests/test_local_workspace.py tests/test_region_rework_ui.py tests/test_region_rework_undo.py tests/test_region_rework_window.py tests/test_region_rework_lifecycle.py
       - name: Build source and bootstrap package
         run: python scripts/build_local_package.py --output release/BallonsTranslator-Local-Windows-source.zip
       - name: Upload Windows source/bootstrap ZIP

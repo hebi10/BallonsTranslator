@@ -454,6 +454,7 @@ class LocalWorkspaceTest(unittest.TestCase):
         from ballontranslator.ui.mainwindow import MainWindow
         event = Mock()
         owner = SimpleNamespace(
+            module_manager=SimpleNamespace(regionReworkBusy=lambda: False),
             local_workspace=None, font_change_detector=Mock(), font_refresh=Mock(),
             st_manager=Mock(), auto_tate_chu_yoko_thread=Mock(isRunning=Mock(return_value=False)),
             imgtrans_proj=SimpleNamespace(is_empty=False), conditional_save=Mock(return_value=False),

@@ -2072,6 +2072,7 @@ class RunPipelineDialogTests(unittest.TestCase):
         pages = []
         finished = []
         owner = SimpleNamespace(
+            regionReworkBusy=lambda: False,
             imgtrans_proj=SimpleNamespace(is_empty=False, num_pages=3),
             progress_msgbox=SimpleNamespace(hide=lambda: None),
             terminateRunningThread=lambda: None,

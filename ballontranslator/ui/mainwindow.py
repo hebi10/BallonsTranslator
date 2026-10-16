@@ -5,10 +5,14 @@ from pathlib import Path
 import subprocess
 from functools import partial
 import time
+import copy
+import math
+
+import numpy as np
 
 from tqdm import tqdm
 from qtpy.QtWidgets import QAction, QFileDialog, QMenu, QHBoxLayout, QVBoxLayout, QApplication, QStackedWidget, QSplitter, QListWidget, QShortcut, QListWidgetItem, QMessageBox, QTextEdit, QPlainTextEdit, QDialog, QWidget, QColorDialog
-from qtpy.QtCore import Qt, QPoint, QSize, QEvent, Signal, QTimer
+from qtpy.QtCore import Qt, QPoint, QSize, QEvent, Signal, QTimer, QRectF
 from qtpy.QtGui import QContextMenuEvent, QTextCursor, QGuiApplication, QIcon, QCloseEvent, QKeySequence, QPainter, QClipboard, QColor
 
 from ballontranslator.utils.logger import logger as LOGGER
@@ -44,10 +48,13 @@ from .text_engine.editing.widgets import SourceTextEdit, TransTextEdit
 from .drawingpanel import DrawingPanel
 from .text_engine.editing.manager import (
     PasteSrcItemsCommand,
+    RegionReworkCommand,
     SceneTextManager,
     SceneTextReplacementReason,
     TextPanel,
 )
+from .text_engine.item import TextBlkItem
+from .region_rework import RegionReworkRequest, RegionReworkResult
 from .mainwindowbars import TitleBar, LeftBar, BottomBar
 from .menu_style import install_app_style_filters
 from .io_thread import ImgSaveThread, ImportDocThread, ExportDocThread
@@ -170,6 +177,8 @@ class MainWindow(mainwindow_cls):
         self._local_output_dir = None
         self._local_save_error = ''
         self._continue_stage_baseline = {}
+        self._region_rework_pending = None
+        self._region_rework_revision = 0
 
         self.setupThread()
         self.setupUi()
@@ -267,6 +276,11 @@ class MainWindow(mainwindow_cls):
         self.local_action.triggered.connect(self.show_local_workspace)
         menu = self.titleBar.toolsToolBtn.menu()
         menu.insertAction(menu.actions()[0], self.local_action)
+        self.region_rework_action = QAction(self.tr('영역 재작업'), self)
+        self.region_rework_action.setShortcut(QKeySequence('Ctrl+Shift+R'))
+        self.region_rework_action.triggered.connect(self.begin_region_rework)
+        menu.insertAction(self.local_action, self.region_rework_action)
+        self.addAction(self.region_rework_action)
         self.leftBar.openBtn.menu().insertAction(self.leftBar.openBtn.menu().actions()[0], self.local_action)
         self.addAction(self.local_action)
         # Fixed local modules need no provider/account selector in the editor.
@@ -573,6 +587,8 @@ class MainWindow(mainwindow_cls):
         self.canvas.gv.hide_canvas.connect(self.onHideCanvas)
         self.canvas.proj_savestate_changed.connect(self.on_savestate_changed)
         self.canvas.textstack_changed.connect(self.on_textstack_changed)
+        self.canvas.textstack_changed.connect(self._region_history_changed)
+        self.canvas.draw_undo_stack.indexChanged.connect(self._region_history_changed)
         self.canvas.run_blktrans.connect(self.on_run_blktrans)
         self.canvas.drop_open_folder.connect(self.dropOpenDir)
         self.canvas.originallayer_trans_slider = self.bottomBar.originalSlider
@@ -584,6 +600,7 @@ class MainWindow(mainwindow_cls):
         self.bottomBar.editingLayerSlider.valueChanged.connect(self.canvas.setEditingLayerOpacityBySlider)
         
         self.drawingPanel = DrawingPanel(self.canvas)
+        self.drawingPanel.region_rework_requested.connect(self.on_region_rework_requested)
         self.textPanel = TextPanel(self.app)
         self.textPanel.formatpanel.foldTextBtn.checkStateChanged.connect(self.fold_textarea)
         self.textPanel.formatpanel.sourceBtn.checkStateChanged.connect(self.show_source_text)
@@ -743,6 +760,8 @@ class MainWindow(mainwindow_cls):
         # Preparation and RUN dialogs share placement so the first RUN is stable.
         module_manager.prepare_msgbox.showed.connect(self.on_imgtrans_progressbox_showed)
         module_manager.blktrans_pipeline_finished.connect(self.on_blktrans_finished)
+        module_manager.region_rework_finished.connect(self.on_region_rework_finished)
+        module_manager.region_rework_failed.connect(self.on_region_rework_failed)
         module_manager.imgtrans_thread.post_process_mask = self.drawingPanel.rectPanel.post_process_mask
         module_manager.translate_thread.finish_set_module.connect(self.on_finish_settranslator)
         self.setTranslatorSelectionFromMetadata(pcfg.module.translator)
@@ -1147,6 +1166,11 @@ class MainWindow(mainwindow_cls):
         save_config()
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        if self.module_manager.regionReworkBusy():
+            self.module_manager.stopImgtransPipeline()
+            event.ignore()
+            create_info_dialog(self.tr('영역 재작업을 중지하고 있습니다. 작업 종료 후 다시 닫아 주세요.'))
+            return
         workspace = getattr(self, 'local_workspace', None)
         if workspace is not None and workspace.busy:
             event.ignore()
@@ -2436,6 +2460,193 @@ class MainWindow(mainwindow_cls):
     def on_run_blktrans(self, mode: int):
         blkitem_list = self.canvas.selected_text_items()
         self.translateBlkitemList(blkitem_list, mode)
+
+    def _region_history_changed(self, *_args: object) -> None:
+        self._region_rework_revision += 1
+
+    def _region_scene_fingerprint(self) -> tuple:
+        """Capture live text and page-space geometry without publishing edits.
+
+        >>> callable(MainWindow._region_scene_fingerprint)
+        True
+        """
+        return tuple(
+            (id(item), pair.e_source.toPlainText(), item.toHtml(),
+             repr(item.get_fontformat()), tuple(item.absBoundingRect()),
+             item.rotation(), repr(item.blk.xyxy), repr(item.blk.lines))
+            for item, pair in zip(self.st_manager.textblk_item_list,
+                                  self.st_manager.pairwidget_list)
+        )
+
+    def begin_region_rework(self) -> None:
+        if not is_local_edition() or self.imgtrans_proj.img_array is None:
+            create_info_dialog(self.tr('먼저 재작업할 이미지 폴더를 열어 주세요.'))
+            return
+        workspace = self.local_workspace
+        if (workspace is not None and workspace.busy
+                or self.module_manager.regionReworkBusy()
+                or self._local_pipeline_busy() or self.imsave_thread.isBusy()):
+            create_info_dialog(self.tr('진행 중인 작업과 저장이 끝난 뒤 영역을 선택해 주세요.'))
+            return
+        if not self.bottomBar.paintChecker.isChecked():
+            self.bottomBar.paintChecker.click()
+        self.drawingPanel.begin_region_rework()
+
+    def on_region_rework_requested(self, rect: object) -> None:
+        workspace = self.local_workspace
+        if (not is_local_edition() or self.imgtrans_proj.img_array is None
+                or workspace is not None and workspace.busy
+                or self.module_manager.regionReworkBusy()
+                or self._local_pipeline_busy() or self.imsave_thread.isBusy()):
+            create_info_dialog(self.tr('진행 중인 작업과 저장이 끝난 뒤 영역을 다시 선택해 주세요.'))
+            return
+        self.st_manager.formatpanel.resolve_text_transform_edits_for_save()
+        QApplication.inputMethod().commit()
+        editing = self.canvas.editing_textblkitem
+        if editing is not None and editing.isEditing():
+            editing.endEdit(keep_focus=False)
+        QApplication.inputMethod().reset()
+        self.st_manager.updateTextBlkList()
+        project = self.imgtrans_proj
+        try:
+            if len(rect) != 4 or not all(math.isfinite(float(value)) for value in rect):
+                raise ValueError
+            height, width = project.img_array.shape[:2]
+            left, right = sorted((float(rect[0]), float(rect[2])))
+            top, bottom = sorted((float(rect[1]), float(rect[3])))
+            region = (max(0, math.floor(left)), max(0, math.floor(top)),
+                      min(width, math.ceil(right)), min(height, math.ceil(bottom)))
+            x1, y1, x2, y2 = region
+            if x1 >= x2 or y1 >= y2:
+                raise ValueError
+            selection = QRectF(x1, y1, x2 - x1, y2 - y1)
+            old_items = []
+            for item in self.st_manager.textblk_item_list:
+                bx1, by1, bx2, by2 = item.blk.xyxy
+                source = QRectF(bx1, by1, bx2 - bx1, by2 - by1).normalized()
+                lines = np.asarray(item.blk.lines)
+                if lines.size:
+                    points = lines.reshape(-1, 2)
+                    lx1, ly1 = points.min(axis=0)
+                    lx2, ly2 = points.max(axis=0)
+                    source = source.united(QRectF(float(lx1), float(ly1),
+                                                 float(lx2-lx1), float(ly2-ly1)))
+                rendered = item.mapRectToParent(item.boundingRect())
+                if selection.intersects(source) or selection.intersects(rendered):
+                    if not selection.contains(source) or not selection.contains(rendered):
+                        create_info_dialog(self.tr('선택 경계에 걸친 대사가 있습니다. 원문과 번역 글자가 모두 포함되도록 말풍선 전체를 선택해 주세요.'))
+                        return
+                    old_items.append(item)
+            if project.inpainted_array is None or project.mask_array is None:
+                raise ValueError
+        except (TypeError, ValueError, OverflowError):
+            create_info_dialog(self.tr('재작업할 이미지 안에서 유효한 영역을 선택해 주세요.'))
+            return
+        snapshot = copy.copy(project)
+        snapshot.pages = copy.deepcopy(project.pages)
+        snapshot._image_info = copy.deepcopy(project._image_info)
+        snapshot._llm_compact_memory = copy.deepcopy(project._llm_compact_memory)
+        snapshot._raster_asset_cache = {}
+        snapshot.img_array = project.img_array.copy()
+        snapshot.inpainted_array = project.inpainted_array.copy()
+        snapshot.mask_array = project.mask_array.copy()
+        request = RegionReworkRequest(
+            region, snapshot.img_array, snapshot.inpainted_array, snapshot.mask_array,
+            snapshot, project.current_img, tuple(item.idx for item in old_items),
+            self.drawingPanel.rectPanel.dilate_slider.value(),
+        )
+        # Preparation may synchronously fail, so publish the guard first.
+        self._region_rework_pending = (
+            project, project._load_identity, project.current_img, region, old_items,
+            self._region_scene_fingerprint(), self._region_rework_revision,
+        )
+        if not self.module_manager.runRegionRework(request):
+            self.on_region_rework_failed(self.tr('다른 작업이 진행 중입니다. 종료 후 다시 선택해 주세요.'))
+
+    def _prepare_region_blocks(self, result: RegionReworkResult) -> tuple[list[TextBlock], bool]:
+        x1, y1, x2, y2 = result.rect
+        selection = QRectF(x1, y1, x2 - x1, y2 - y1)
+        prepared = []
+        review_needed = False
+        manager = self.st_manager
+        previous_auto_layout = manager.auto_textlayout_flag
+        manager.auto_textlayout_flag = True
+        try:
+            for original in result.blocks:
+                block = copy.deepcopy(original)
+                detected_size = block.font_size
+                block.fontformat = self.textPanel.formatpanel.global_format.deepcopy()
+                if pcfg.let_fntsize_flag == 0 and detected_size > 0:
+                    block.font_size = detected_size
+                block.vertical = False
+                block.alignment = TextAlignment.Center
+                block.rich_text = ''
+                text = block.translation
+                block.translation = ''
+                item = TextBlkItem(block, len(manager.pairwidget_list) + len(prepared),
+                                   show_rect=False)
+                try:
+                    fitted = manager.layout_textblk(item, text=text)
+                    review_needed = review_needed or fitted is not True
+                    if not item.toPlainText().strip():
+                        item.setPlainText(text)
+                    paint = item.mapRectToParent(item.boundingRect())
+                    minimum_height, minimum_width = item.layout.minSize()
+                    logical = item.logical_unpadded_rect()
+                    if (not selection.contains(paint)
+                            or re.sub(r'\s+', '', item.toPlainText()) != re.sub(r'\s+', '', text)
+                            or minimum_width > logical.width() + .5
+                            or minimum_height > logical.height() + .5
+                            or not all(math.isfinite(value) for value in
+                                       (paint.left(), paint.top(), paint.right(), paint.bottom()))):
+                        raise ValueError('region layout overflow')
+                    block.translation = item.toPlainText()
+                    block.rich_text = item.toHtml()
+                    block._bounding_rect = item.absBoundingRect()
+                    item.updateBlkFormat()
+                    prepared.append(block)
+                finally:
+                    item.geometry_controller.release_render_resources()
+                    item.deleteLater()
+        finally:
+            manager.auto_textlayout_flag = previous_auto_layout
+        if not prepared:
+            raise ValueError('region has no dialogue')
+        return prepared, review_needed
+
+    def on_region_rework_finished(self, result: RegionReworkResult) -> None:
+        pending = self._region_rework_pending
+        self._region_rework_pending = None
+        if pending is None:
+            return
+        project, identity, page, rect, old_items, fingerprint, revision = pending
+        self.st_manager.formatpanel.resolve_text_transform_edits_for_history_change()
+        QApplication.inputMethod().commit()
+        if (self.imgtrans_proj is not project or project._load_identity is not identity
+                or project.current_img != page or result.rect != rect
+                or self._region_rework_revision != revision
+                or self._region_scene_fingerprint() != fingerprint):
+            create_info_dialog(self.tr('작업 중 페이지나 대사가 바뀌어 결과를 적용하지 않았습니다. 영역을 다시 선택해 주세요.'))
+            return
+        try:
+            prepared, review_needed = self._prepare_region_blocks(result)
+            command = RegionReworkCommand(self.st_manager, old_items, prepared,
+                                          rect, result.inpainted, result.mask)
+        except Exception:
+            create_info_dialog(self.tr('번역 글자를 선택 영역 안에 안전하게 배치하지 못했습니다. 기존 결과는 유지됩니다. 영역을 넓히거나 대사를 직접 수정해 주세요.'))
+            return
+        self.canvas.push_text_command(command)
+        self.bottomBar.paintChecker.setChecked(False)
+        self.bottomBar.texteditChecker.setChecked(True)
+        self.setTextEditMode()
+        self.llmContextEditor.refresh_context()
+        self.global_search_widget.set_document_edited()
+        if review_needed:
+            create_info_dialog(self.tr('선택 영역 재작업을 완료했습니다. 배경 위 대사 등 말풍선 경계를 확인하기 어려운 글자는 배치를 직접 확인해 주세요. Ctrl+Z로 되돌릴 수 있습니다.'))
+
+    def on_region_rework_failed(self, message: str) -> None:
+        self._region_rework_pending = None
+        create_info_dialog(message or self.tr('영역 재작업에 실패했습니다. 기존 결과는 유지됩니다.'))
 
     def on_blktrans_finished(self, mode: int, blk_ids: List[int]):
 

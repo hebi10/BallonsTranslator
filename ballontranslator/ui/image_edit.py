@@ -249,14 +249,24 @@ class DrawingLayer(QGraphicsPixmapItem):
         super().__init__()
         self.qimg_dict = {}
         self.drawing_items_info = {}
+        self._drawing_order: dict[str, int] = {}
         self._drawn_pixmap: QPixmap | None = None
 
     def addQImage(
         self, x: int, y: int, qimg: QImage,
         compose_mode: QPainter.CompositionMode, key: str,
     ) -> None:
+        restoring = key in self._drawing_order and key not in self.qimg_dict
+        if key not in self._drawing_order:
+            self._drawing_order[key] = len(self._drawing_order)
         self.qimg_dict[key] = qimg
         self.drawing_items_info[key] = {'pos': [x, y], 'compose': compose_mode}
+        if restoring:
+            # Text and drawing histories can replay independently. Restored
+            # strokes must keep their original position below later erasers.
+            ordered = sorted(self.qimg_dict.items(), key=lambda pair: self._drawing_order[pair[0]])
+            self.qimg_dict.clear()
+            self.qimg_dict.update(ordered)
         self.updateDrawing()
 
     def removeQImage(self, key: str) -> None:
@@ -313,4 +323,5 @@ class DrawingLayer(QGraphicsPixmapItem):
     def clearAllDrawings(self) -> None:
         self.qimg_dict.clear()
         self.drawing_items_info.clear()
+        self._drawing_order.clear()
         self.updateDrawing()

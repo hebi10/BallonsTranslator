@@ -1,6 +1,7 @@
 
 from enum import Enum
 from typing import List, Optional, Sequence, Union, Tuple
+from uuid import uuid4
 import numpy as np
 import copy
 import cv2
@@ -8,7 +9,7 @@ import math
 
 from qtpy.QtWidgets import QApplication, QWidget
 from qtpy.QtCore import QObject, QRectF, Qt, Signal, QPointF
-from qtpy.QtGui import QKeyEvent, QTextCursor, QFontMetricsF, QFont, QTextCharFormat, QClipboard
+from qtpy.QtGui import QKeyEvent, QTextCursor, QFontMetricsF, QFont, QTextCharFormat, QClipboard, QImage, QPainter
 try:
     from qtpy.QtWidgets import QUndoCommand
 except:
@@ -16,6 +17,7 @@ except:
 
 from ..item import TextBlkItem, TextBlock
 from ...canvas import Canvas
+from ...misc import pixmap2ndarray
 from .widgets import TransTextEdit, SourceTextEdit, TransPairWidget, TextEditListScrollArea, QVBoxLayout, Widget
 from ballontranslator.utils.fontformat import FontFormat
 from .commands import (
@@ -300,6 +302,146 @@ class DeleteBlkItemsCommand(QUndoCommand):
             self.sw.search_counter_list += self.search_counter_list
             self.sw.highlighter_list += self.highlighter_list
             self.sw.updateCounterText()
+
+
+class RegionReworkCommand(QUndoCommand):
+    """Replace selected blocks and page pixels as one reversible operation.
+
+    Detached items keep their documents and paired editors so earlier text
+    commands remain valid. New blocks arrive with committed layout already set.
+
+    >>> callable(RegionReworkCommand.redo)
+    True
+    """
+
+    def __init__(
+        self,
+        ctrl: 'SceneTextManager',
+        old_items: List[TextBlkItem],
+        new_blocks: List[TextBlock],
+        rect: Tuple[int, int, int, int],
+        inpainted: np.ndarray,
+        mask: np.ndarray,
+    ) -> None:
+        super().__init__()
+        if not old_items and not new_blocks:
+            raise ValueError('Region rework requires text blocks')
+        if len(rect) != 4 or any(not isinstance(value, (int, np.integer)) for value in rect):
+            raise ValueError('Region rectangle must contain four integer coordinates')
+        x1, y1, x2, y2 = rect
+        project = ctrl.imgtrans_proj
+        height, width = project.inpainted_array.shape[:2]
+        if not (0 <= x1 < x2 <= width and 0 <= y1 < y2 <= height):
+            raise ValueError('Region rectangle is outside the page')
+        if (inpainted.shape != project.inpainted_array[y1:y2, x1:x2].shape
+                or mask.shape != project.mask_array[y1:y2, x1:x2].shape
+                or inpainted.dtype != project.inpainted_array.dtype
+                or mask.dtype != project.mask_array.dtype):
+            raise ValueError('Region image and mask must match the page crop')
+        if (len(set(old_items)) != len(old_items)
+                or any(item not in ctrl.textblk_item_list for item in old_items)):
+            raise ValueError('Region items must belong to the current scene')
+
+        ctrl.formatpanel.resolve_text_transform_edits_for_history_change()
+        self.ctrl = ctrl
+        self.canvas = ctrl.canvas
+        self.rect = tuple(int(value) for value in rect)
+        self.old_items = sorted(old_items, key=lambda item: item.idx)
+        self.old_indexes = [item.idx for item in self.old_items]
+        self.old_pairs = [ctrl.pairwidget_list[index] for index in self.old_indexes]
+        self.insert_index = self.old_indexes[0] if self.old_indexes else len(ctrl.textblk_item_list)
+        self.new_blocks = copy.deepcopy(new_blocks)
+        self.new_items: Optional[List[TextBlkItem]] = None
+        self.new_pairs: List[TransPairWidget] = []
+        self.old_image = project.inpainted_array[y1:y2, x1:x2].copy()
+        self.old_mask = project.mask_array[y1:y2, x1:x2].copy()
+        self.new_image = inpainted.copy()
+        self.new_mask = mask.copy()
+        self.pixels_changed = (
+            not np.array_equal(self.old_image, self.new_image)
+            or not np.array_equal(self.old_mask, self.new_mask)
+        )
+        drawing_crop = pixmap2ndarray(self.canvas.drawingLayer.get_drawed_pixmap().copy(
+            x1, y1, x2 - x1, y2 - y1,
+        ))
+        self.drawing_eraser: Optional[QImage] = None
+        if drawing_crop is not None and np.any(drawing_crop[:, :, 3]):
+            self.drawing_eraser = QImage(
+                x2 - x1, y2 - y1, QImage.Format.Format_ARGB32_Premultiplied,
+            )
+            self.drawing_eraser.fill(Qt.GlobalColor.black)
+            self.drawing_key = uuid4().hex
+
+    def _prepare_replay(self) -> None:
+        editing = self.canvas.editing_textblkitem
+        if editing is not None and editing.isEditing():
+            editing.endEdit(keep_focus=False)
+        QApplication.inputMethod().reset()
+        focus = QApplication.focusWidget()
+        if isinstance(focus, SourceTextEdit):
+            focus.clearFocus()
+        self.ctrl.changeHoveringWidget(None)
+        self.ctrl.textEditList.clearAllSelected(emit_signal=False)
+        self.canvas.set_primary_selected_text_item(None)
+        self.ctrl.set_blkitems_selection(False)
+        self.canvas.search_widget.clean_highlighted()
+        self.canvas.search_widget.clearSearchResult()
+        self.canvas.search_widget.counter_sum = 0
+
+    def _recover(
+        self,
+        items: List[TextBlkItem],
+        pairs: List[TransPairWidget],
+        indexes: Sequence[int],
+    ) -> None:
+        for item, pair, index in zip(items, pairs, indexes):
+            item.idx = index
+            pair.updateIndex(index)
+        self.ctrl.recoverTextblkItemList(items, pairs)
+
+    def _publish(self, image: np.ndarray, mask: np.ndarray, clear_drawing: bool) -> None:
+        project = self.ctrl.imgtrans_proj
+        # Publish membership once; unaffected live documents stay untouched.
+        project.current_block_list()[:] = [item.blk for item in self.ctrl.textblk_item_list]
+        if self.pixels_changed:
+            x1, y1, x2, y2 = self.rect
+            project.inpainted_array[y1:y2, x1:x2] = image
+            project.mask_array[y1:y2, x1:x2] = mask
+            self.canvas.updateLayers()
+        if self.drawing_eraser is not None:
+            if clear_drawing:
+                self.canvas.drawingLayer.addQImage(
+                    self.rect[0], self.rect[1], self.drawing_eraser,
+                    QPainter.CompositionMode.CompositionMode_DestinationOut, self.drawing_key,
+                )
+            else:
+                self.canvas.drawingLayer.removeQImage(self.drawing_key)
+        if self.pixels_changed or self.drawing_eraser is not None:
+            self.canvas.draw_undo_stack.resetClean()
+        self.canvas.search_widget.page_search()
+
+    def redo(self) -> None:
+        self._prepare_replay()
+        self.ctrl.deleteTextblkItemList(self.old_items, self.old_pairs)
+        if self.new_items is None:
+            self.new_items = []
+            for block in self.new_blocks:
+                # Passing an item bypasses the manager's pipeline auto-layout.
+                item = TextBlkItem(block, len(self.ctrl.textblk_item_list),
+                                   show_rect=self.canvas.textblock_mode)
+                self.ctrl.addTextBlock(item)
+                self.new_items.append(item)
+                self.new_pairs.append(self.ctrl.pairwidget_list[item.idx])
+            self.ctrl.deleteTextblkItemList(self.new_items, self.new_pairs)
+        self._recover(self.new_items, self.new_pairs,
+                      range(self.insert_index, self.insert_index + len(self.new_items)))
+        self._publish(self.new_image, self.new_mask, clear_drawing=True)
+
+    def undo(self) -> None:
+        self._prepare_replay()
+        self.ctrl.deleteTextblkItemList(self.new_items, self.new_pairs)
+        self._recover(self.old_items, self.old_pairs, self.old_indexes)
+        self._publish(self.old_image, self.old_mask, clear_drawing=False)
 
 
 class PasteBlkItemsCommand(QUndoCommand):

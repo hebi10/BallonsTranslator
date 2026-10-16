@@ -12,6 +12,7 @@ from .funcmaps import get_maskseg_method
 from .packageinstall_thread import PackageInstallThread
 from .package_manager import create_package_manager
 from .torch_install_dialog import confirm_torch_install_device
+from .region_rework import RegionReworkRequest
 from ballontranslator.utils.logger import logger as LOGGER
 from ballontranslator.utils.registry import LazyModuleError, Registry
 from ballontranslator.utils.imgproc_utils import enlarge_window, get_block_mask
@@ -794,6 +795,7 @@ class ImgtransThread(QThread):
 
     finish_blktrans_stage = Signal(str, int)
     finish_blktrans = Signal(int, list)
+    region_progress = Signal(str, int)
     unload_modules = Signal(list)
 
     detect_counter = 0
@@ -967,6 +969,40 @@ class ImgtransThread(QThread):
             if full_page and project is not None and page_key is not None:
                 project.mark_stage_failed(page_key, 'translate')
         return False
+
+    def runRegionRework(self, request: RegionReworkRequest) -> None:
+        self.clearStopRequest()
+        self.region_request = request
+        self.region_result = None
+        self.region_error = ''
+        self.job = self._region_rework_pipeline
+        self.start()
+
+    def _region_rework_pipeline(self) -> None:
+        from .region_rework import rework_region
+        from ballontranslator.utils.local_edition import is_local_edition
+        try:
+            if is_local_edition():
+                from ballontranslator.utils.local_ollama import OllamaClient, LocalOperationCancelled
+                try:
+                    OllamaClient().unload(stop_event=self.stop_event)
+                except LocalOperationCancelled as error:
+                    raise LLMRequestStopped(str(error)) from error
+            self.region_result = rework_region(
+                self.region_request, self.textdetector, self.ocr, self.translator,
+                self.inpainter, self.stop_event, self.region_progress.emit,
+                before_translate=self._release_region_image_models,
+            )
+        except LLMRequestStopped:
+            self.region_error = self.tr('영역 재작업을 취소했습니다. 기존 결과는 유지됩니다.')
+        except Exception as error:
+            self.region_error = str(error)
+            LOGGER.error('Region rework failed: %s', type(error).__name__)
+
+    def _release_region_image_models(self) -> None:
+        from ballontranslator.utils.local_edition import is_local_edition
+        if is_local_edition():
+            unload_modules(self, ['textdetector', 'ocr', 'inpainter'])
 
     def _translate_full_page(
         self,
@@ -1487,6 +1523,8 @@ class ModuleManager(QObject):
 
     imgtrans_pipeline_finished = Signal()
     blktrans_pipeline_finished = Signal(int, list)
+    region_rework_finished = Signal(object)
+    region_rework_failed = Signal(str)
     page_trans_finished = Signal(int)
     module_selection_changed = Signal(str, str)
 
@@ -1500,6 +1538,7 @@ class ModuleManager(QObject):
         self.imgtrans_proj = imgtrans_proj
         self._pending_canvas_inpaint: Optional[dict] = None
         self._canvas_inpaint_request: Optional[dict] = None
+        self._region_request: Optional[dict] = None
         self.check_inpaint_fin_timer = QTimer(self)
         self.check_inpaint_fin_timer.timeout.connect(self.check_inpaint_th_finished)
         self.prepare_msgbox: ProgressMessageBox = None
@@ -1542,10 +1581,12 @@ class ModuleManager(QObject):
             module_thread.module_prepare_progress.connect(self.on_module_prepare_progress)
             module_thread.finish_set_module.connect(lambda th=module_thread: self.on_module_prepare_finished(th))
             module_thread.finished.connect(self._continue_pending_prepare)
+            module_thread.finished.connect(self._continue_region_rework)
 
         self.package_install_thread = PackageInstallThread()
         self.package_install_thread.package_prepare_progress.connect(self.on_module_prepare_progress)
         self.package_install_thread.finish_install.connect(self.on_batch_package_install_finished)
+        self.package_install_thread.finished.connect(self._continue_region_rework)
 
         self.progress_msgbox = imgtrans_progress_msgbox
         self.progress_msgbox.stop_clicked.connect(self.stopImgtransPipeline)
@@ -1559,6 +1600,8 @@ class ModuleManager(QObject):
         self.imgtrans_thread.finish_blktrans_stage.connect(self.on_finish_blktrans_stage)
         self.imgtrans_thread.finish_blktrans.connect(self.on_finish_blktrans)
         self.imgtrans_thread.pipeline_stopped.connect(self.on_imgtrans_thread_stopped)
+        self.imgtrans_thread.region_progress.connect(self._on_region_progress)
+        self.imgtrans_thread.finished.connect(self._finish_region_rework)
         self.imgtrans_thread.finished.connect(self._continue_canvas_inpaint)
 
         merge_config_module_params(
@@ -1893,6 +1936,10 @@ class ModuleManager(QObject):
         self._pending_batch_package_failure = None
         if on_failure is not None:
             on_failure()
+        # Preparation success can arrive before the native thread exits. Its
+        # callback is already consumed, but the deferred region must still stop.
+        if self.regionReworkBusy() and not self.imgtrans_thread.isRunning():
+            self._fail_region_rework()
 
     @staticmethod
     def _installing_packages_summary(requirements: List[str]) -> str:
@@ -2178,6 +2225,8 @@ class ModuleManager(QObject):
         render_only=False,
         continue_mode: bool = False,
     ) -> None:
+        if self.regionReworkBusy():
+            return
         _reset_llm_key_required_dialogs()
         if self.imgtrans_proj.is_empty:
             LOGGER.info('proj file is empty, nothing to do')
@@ -2259,6 +2308,8 @@ class ModuleManager(QObject):
         *,
         page_key: str = None,
     ):
+        if self.regionReworkBusy():
+            return
         _reset_llm_key_required_dialogs()
         self.terminateRunningThread()
         required_modules = []
@@ -2371,6 +2422,8 @@ class ModuleManager(QObject):
     
     def on_imgtrans_thread_stopped(self):
         """线程完成时确保关闭进度对话框"""
+        if self.regionReworkBusy():
+            return
         # 线程完成了，直接关闭窗口
         self.progress_msgbox.hide()
         self.imgtrans_pipeline_finished.emit()
@@ -2516,6 +2569,7 @@ class ModuleManager(QObject):
     def _continue_canvas_inpaint(self) -> None:
         if (
             self._pending_canvas_inpaint is None
+            or self.regionReworkBusy()
             or self.inpaint_thread.isRunning()
             or self.imgtrans_thread.isRunning()
             or self._pending_prepare_success is not None
@@ -2664,6 +2718,10 @@ class ModuleManager(QObject):
             module.updateParam(param_key, param_content['content'])
 
     def handle_page_changed(self) -> None:
+        if self.regionReworkBusy():
+            self.imgtrans_thread.requestStop()
+            self.cancelModulePreparation()
+            self._fail_region_rework(self.tr('페이지가 바뀌어 영역 재작업을 취소했습니다.'))
         if self._pending_canvas_inpaint is not None:
             LOGGER.info('Draw inpaint queued request discarded: page changed, rectangle=%s',
                         self._pending_canvas_inpaint.get('inpaint_rect'))
@@ -2676,3 +2734,105 @@ class ModuleManager(QObject):
             # process. Let it finish, discard its result, then run the next page.
             if self.inpaint_thread.pipeline_stop_event is not None:
                 self.inpaint_thread.pipeline_stop_event.set()
+
+    def regionReworkBusy(self) -> bool:
+        return self._region_request is not None
+
+    def runRegionRework(self, request: RegionReworkRequest) -> bool:
+        if (self.regionReworkBusy() or self.imgtrans_thread.isRunning()
+                or self._module_preparation_running()
+                or self._pending_prepare_success is not None
+                or self._pending_batch_package_success is not None
+                or self._pending_canvas_inpaint is not None
+                or self._canvas_inpaint_request is not None):
+            return False
+        project = self.imgtrans_proj
+        self._region_request = {
+            'request': request,
+            'identity': project._load_identity,
+            'arrays': (project.img_array, project.inpainted_array, project.mask_array),
+            'prepared': False,
+        }
+        self._prepare_modules_then(
+            self._selected_modules(), self._start_region_rework,
+            on_failure=self._fail_region_rework,
+        )
+        return True
+
+    def _region_source_matches(self) -> bool:
+        pending = self._region_request
+        if pending is None:
+            return False
+        request = pending['request']
+        project = self.imgtrans_proj
+        if project._load_identity is not pending['identity'] or project.current_img != request.page_key:
+            return False
+        arrays = (project.img_array, project.inpainted_array, project.mask_array)
+        snapshots = (request.image, request.inpainted, request.mask)
+        return all(current is original and np.array_equal(current, snapshot)
+                   for current, original, snapshot in zip(arrays, pending['arrays'], snapshots))
+
+    def _start_region_rework(self) -> None:
+        if self._region_request is not None:
+            self._region_request['prepared'] = True
+        self._continue_region_rework()
+
+    def _continue_region_rework(self) -> None:
+        pending = self._region_request
+        if pending is None or not pending['prepared']:
+            return
+        if self.imgtrans_thread.isRunning() or self._module_preparation_running():
+            return
+        if not self._region_source_matches():
+            self._fail_region_rework(self.tr('이미지가 바뀌었습니다. 영역을 다시 선택해 주세요.'))
+            return
+        pending['prepared'] = False
+        self.prepare_msgbox.hide()
+        self.progress_msgbox.zero_progress()
+        for bar in (self.progress_msgbox.detect_bar, self.progress_msgbox.ocr_bar,
+                    self.progress_msgbox.inpaint_bar, self.progress_msgbox.translate_bar):
+            bar.show()
+        self.progress_msgbox.show_fitted()
+        self.imgtrans_thread.runRegionRework(self._region_request['request'])
+
+    def _on_region_progress(self, stage: str, value: int) -> None:
+        if not self.regionReworkBusy():
+            return
+        updates = {'detect': self.progress_msgbox.updateDetectProgress,
+                   'ocr': self.progress_msgbox.updateOCRProgress,
+                   'inpaint': self.progress_msgbox.updateInpaintProgress,
+                   'translate': self.progress_msgbox.updateTranslateProgress}
+        updates[stage](value)
+
+    def _clear_region_request(self) -> None:
+        pending = self._region_request
+        self._region_request = None
+        if pending is not None:
+            self.progress_msgbox.hide()
+
+    def _fail_region_rework(self, message: str = '') -> None:
+        if not self.regionReworkBusy():
+            return
+        if self.imgtrans_thread.isRunning():
+            self.imgtrans_thread.requestStop()
+            return
+        self._clear_region_request()
+        self.region_rework_failed.emit(message or self.tr('영역 재작업 준비가 취소되었거나 실패했습니다. 기존 결과는 유지됩니다.'))
+
+    def _finish_region_rework(self) -> None:
+        if not self.regionReworkBusy():
+            return
+        worker = self.imgtrans_thread
+        result = getattr(worker, 'region_result', None)
+        error = getattr(worker, 'region_error', '')
+        if worker.isStopRequested():
+            error = self.tr('영역 재작업을 취소했습니다. 기존 결과는 유지됩니다.')
+        elif not self._region_source_matches():
+            error = self.tr('이미지가 바뀌어 재작업 결과를 적용하지 않았습니다. 영역을 다시 선택해 주세요.')
+        self._clear_region_request()
+        worker.region_request = None
+        worker.region_result = None
+        if error or result is None:
+            self.region_rework_failed.emit(error or self.tr('영역 재작업에 실패했습니다. 기존 결과는 유지됩니다.'))
+        else:
+            self.region_rework_finished.emit(result)
