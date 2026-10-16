@@ -27,6 +27,11 @@ TEST_FILES = (
 
 
 def main() -> int:
+    # Windows CI can redirect stdout using a legacy code page. Preserve Korean
+    # diagnostics instead of crashing while reporting the original test error.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, 'reconfigure'):
+            stream.reconfigure(encoding='utf-8', errors='replace')
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument('--files', nargs='+', default=TEST_FILES)
@@ -38,7 +43,7 @@ def main() -> int:
     for name in args.files:
         if not (root / name).is_file():
             parser.error(f'Test file is missing: {name}')
-    environment = dict(os.environ, QT_QPA_PLATFORM='offscreen', PYTHONUTF8='1')
+    environment = dict(os.environ, QT_QPA_PLATFORM='offscreen', PYTHONUTF8='1', PYTHONIOENCODING='utf-8')
     failures = []
     for name in args.files:
         print(f'RUN {name}', flush=True)

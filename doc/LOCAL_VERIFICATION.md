@@ -8,7 +8,7 @@
 - `scripts/run_local_regressions.py`: 로컬판 관련 16개 파일, 총 305개 테스트와 하위 사례 122개.
 - PyQt5에서 한국어 분리·조판·작업 저장 관련 3개 파일, 73개 테스트 통과.
 - 기존 가로 공백·세로 정렬 관련 16개 테스트와 하위 사례 22개 통과.
-- `python -m pytest scripts/tests -q`: 패키지 경계와 독립 테스트 프로세스에 대한 7개 테스트.
+- `python -m pytest scripts/tests -q`: 패키지 경계와 독립 테스트 프로세스에 대한 8개 테스트. Windows 콘솔의 한글 오류 출력과 실패 후 다음 검사 진행도 확인합니다.
 - Python 컴파일 및 `git diff --check`.
 - Qt offscreen에서 전체 MainWindow 실행·종료, 한국어 준비 화면 렌더링과 5개 준비 항목 표시 확인.
 - 로컬 가짜 HTTP 서버로 정확한 모델 태그, 프록시 무시, 리다이렉트 차단, JSON 응답, 기존 번역기와의 연결, 중도 종료 응답 거부, 멈춘 응답의 취소를 검사했습니다.

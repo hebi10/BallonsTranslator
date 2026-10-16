@@ -15,7 +15,7 @@ class LocalRegressionRunnerTests(unittest.TestCase):
         self.root = Path(self.temp.name)
 
     def run_tests(self, names):
-        return subprocess.run([sys.executable, str(RUNNER), '--root', str(self.root), '--files', *names], capture_output=True, text=True)
+        return subprocess.run([sys.executable, str(RUNNER), '--root', str(self.root), '--files', *names], capture_output=True, text=True, encoding='utf-8')
 
     def test_files_use_separate_processes_and_offscreen_environment(self):
         for index in range(2):
@@ -39,6 +39,20 @@ class LocalRegressionRunnerTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('missing.py', result.stderr)
         self.assertFalse((self.root / 'ran').exists())
+
+    def test_korean_failure_survives_legacy_console_encoding_and_continues(self):
+        (self.root / 'test_한국어.py').write_text('def test_failure():\n    assert False, "말풍선 확인 필요"\n', encoding='utf-8')
+        (self.root / 'test_next.py').write_text('def test_next():\n    assert True\n', encoding='utf-8')
+        result = subprocess.run(
+            [sys.executable, str(RUNNER), '--root', str(self.root), '--files', 'test_한국어.py', 'test_next.py'],
+            env=dict(os.environ, PYTHONIOENCODING='cp1252', PYTHONUTF8='0'),
+            capture_output=True, text=True, encoding='utf-8',
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('말풍선 확인 필요', result.stdout)
+        self.assertIn('FAIL test_한국어.py', result.stdout)
+        self.assertIn('PASS test_next.py', result.stdout)
+        self.assertNotIn('UnicodeEncodeError', result.stderr)
 
 
 if __name__ == '__main__':
