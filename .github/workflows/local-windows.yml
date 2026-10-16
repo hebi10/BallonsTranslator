@@ -33,6 +33,8 @@ jobs:
       OLLAMA_NO_CLOUD: '1'
       HF_HUB_OFFLINE: '1'
       TRANSFORMERS_OFFLINE: '1'
+      PYTHONUTF8: '1'
+      READER_SCREENSHOT_DIR: reader-screenshots/qt6
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -41,6 +43,12 @@ jobs:
           cache: pip
       - name: Install UI and test dependencies
         run: python -m pip install -r requirements.txt pytest "openai>=2.8.1" "PyQt5==5.15.11"
+      - name: Prepare Korean font for UI verification only
+        shell: powershell
+        run: |
+          $FontPath = Join-Path $env:RUNNER_TEMP 'NotoSansCJKkr-Regular.otf'
+          Invoke-WebRequest -UseBasicParsing -Uri 'https://raw.githubusercontent.com/notofonts/noto-cjk/main/Sans/OTF/Korean/NotoSansCJKkr-Regular.otf' -OutFile $FontPath
+          "READER_TEST_FONT=$FontPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Parse and test Windows launch scripts
         shell: powershell
         run: ./scripts/test_local_windows.ps1
@@ -53,7 +61,16 @@ jobs:
       - name: Verify Korean typesetting and region rework with Qt 5
         env:
           QT_API: pyqt5
-        run: python scripts/run_local_regressions.py --files tests/test_korean_segmentation.py tests/test_korean_layout.py tests/test_local_workspace.py tests/test_region_rework_ui.py tests/test_region_rework_undo.py tests/test_region_rework_window.py tests/test_region_rework_lifecycle.py
+          READER_SCREENSHOT_DIR: reader-screenshots/qt5
+        run: python scripts/run_local_regressions.py --files tests/test_result_reader_ui.py tests/test_korean_segmentation.py tests/test_korean_layout.py tests/test_local_workspace.py tests/test_region_rework_ui.py tests/test_region_rework_undo.py tests/test_region_rework_window.py tests/test_region_rework_lifecycle.py
+      - name: Upload reader UI verification images
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reader-ui-verification
+          path: reader-screenshots/
+          if-no-files-found: ignore
+          retention-days: 14
       - name: Build source and bootstrap package
         run: python scripts/build_local_package.py --output release/BallonsTranslator-Local-Windows-source.zip
       - name: Upload Windows source/bootstrap ZIP
