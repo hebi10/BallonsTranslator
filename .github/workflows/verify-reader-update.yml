@@ -72,7 +72,7 @@ jobs:
               for path, data in results.items():
                   path.parent.mkdir(parents=True, exist_ok=True)
                   path.write_bytes(data)
-              subprocess.run(['git', 'add', '--', *paths], check=True)
+              subprocess.run(['git', 'add', '-f', '--', *paths], check=True)
               subprocess.run(['git', 'rm', '--', *(str(p.relative_to(root)).replace('\\', '/') for p in fragments)], check=True)
               subprocess.run(['git', 'config', 'user.name', 'github-actions[bot]'], check=True)
               subprocess.run(['git', 'config', 'user.email', '41898282+github-actions[bot]@users.noreply.github.com'], check=True)
