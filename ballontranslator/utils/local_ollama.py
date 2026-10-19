@@ -356,6 +356,8 @@ class OllamaClient:
                          source_language: str = '日本語') -> str:
         if source_language == 'English':
             source_name, sample_text = 'English', 'Hello, how are you?'
+        elif source_language == 'Auto':
+            source_name, sample_text = 'English and Japanese', 'Hello! こんにちは'
         elif source_language == '日本語':
             source_name, sample_text = 'Japanese', 'こんにちは'
         else:

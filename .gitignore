@@ -3,6 +3,11 @@ local_*
 !ballontranslator/utils/local_edition.py
 !ballontranslator/utils/local_ollama.py
 !ballontranslator/ui/local_workspace.py
+!ballontranslator/ui/local_preview.py
+!ballontranslator/ui/local_review_dialog.py
+!ballontranslator/utils/local_language.py
+!ballontranslator/utils/local_project.py
+!ballontranslator/utils/local_review.py
 !scripts/local_windows_helpers.ps1
 inpainted
 mask

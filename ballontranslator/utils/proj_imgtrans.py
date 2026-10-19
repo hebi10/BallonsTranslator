@@ -158,6 +158,8 @@ class ProjImgTrans:
         self._idx2pagename = {}
         self._image_info = {}
         self._llm_compact_memory: Optional[Dict] = None
+        self.local_settings: Dict = {}
+        self.local_review: Dict = {'pages': {}, 'acknowledged': []}
 
         self._fuzzy_inpainted_list = None
 
@@ -194,31 +196,38 @@ class ProjImgTrans:
         return self.type+'_'+osp.basename(self.directory)
 
     def load(self, directory: str, json_path: str = None) -> bool:
-        self._raster_asset_cache.clear()
-        self.directory = directory
-        if json_path is None:
-            self.proj_path = osp.join(
-                self.directory, self.proj_name() + '.json'
-            )
-        else:
-            self.proj_path = json_path
-        new_proj = False
-        if not osp.exists(self.proj_path):
-            new_proj = True
-            self.new_project()
-        else:
-            try:
-                with open(self.proj_path, 'r', encoding='utf8') as f:
-                    proj_dict = json.loads(f.read())
-            except Exception as e:
-                raise ProjectLoadFailureException(e)
-            self.load_from_dict(proj_dict)
-        if not osp.exists(self.inpainted_dir()):
-            os.makedirs(self.inpainted_dir())
-        if not osp.exists(self.mask_dir()):
-            os.makedirs(self.mask_dir())
+        previous = self.__dict__.copy()
+        previous['new_pages'] = self.new_pages.copy()
+        try:
+            self._raster_asset_cache.clear()
+            self.directory = directory
+            if json_path is None:
+                self.proj_path = osp.join(
+                    self.directory, self.proj_name() + '.json'
+                )
+            else:
+                self.proj_path = json_path
+            new_proj = False
+            if not osp.exists(self.proj_path):
+                new_proj = True
+                self.new_project()
+            else:
+                try:
+                    with open(self.proj_path, 'r', encoding='utf8') as f:
+                        proj_dict = json.loads(f.read())
+                except Exception as e:
+                    raise ProjectLoadFailureException(e)
+                self.load_from_dict(proj_dict)
+            if not osp.exists(self.inpainted_dir()):
+                os.makedirs(self.inpainted_dir())
+            if not osp.exists(self.mask_dir()):
+                os.makedirs(self.mask_dir())
 
-        return new_proj
+            return new_proj
+        except Exception:
+            self.__dict__.clear()
+            self.__dict__.update(previous)
+            raise
 
     def mask_dir(self):
         return osp.join(self.directory, 'mask')
@@ -627,9 +636,14 @@ class ProjImgTrans:
         )
 
     def load_from_dict(self, proj_dict: dict):
+        from .local_project import normalize_local_settings
+        from .local_review import normalize_local_review
+
         self._raster_asset_cache.clear()
         self.set_current_img(None)
         self._llm_compact_memory = None
+        self.local_settings = normalize_local_settings(proj_dict.get('local_settings', {}))
+        self.local_review = normalize_local_review(proj_dict.get('local_review', {}))
         effect_notices = set()
 
         def load_blocks(records: List[dict]) -> List[TextBlock]:
@@ -674,6 +688,13 @@ class ProjImgTrans:
             if p not in self._image_info:
                 self._image_info[p] = {}
             img_info = self._image_info[p]
+            source_override = img_info.get('local_source_language')
+            if 'local_source_language' in img_info and (
+                not isinstance(source_override, str)
+                or source_override not in ('Auto', '日本語', 'English')
+            ):
+                LOGGER.warning('Ignoring invalid local source language for page %s.', p)
+                img_info.pop('local_source_language', None)
             failed_stage = img_info.get('pipeline_failed_stage')
             if 'pipeline_failed_stage' in img_info and (
                 not isinstance(failed_stage, str)
@@ -1030,6 +1051,8 @@ class ProjImgTrans:
         self._idx2pagename = {}
         self._image_info = {}
         self._llm_compact_memory = None
+        self.local_settings = {}
+        self.local_review = {'pages': {}, 'acknowledged': []}
         for ii, imgname in enumerate(imglist):
             self.pages[imgname] = []
             self._pagename2idx[imgname] = ii
@@ -1064,6 +1087,8 @@ class ProjImgTrans:
             'pages': pages,
             'current_img': self.current_img,
             'image_info': image_info,
+            'local_settings': copy.deepcopy(self.local_settings),
+            'local_review': copy.deepcopy(self.local_review),
         }
         memory_record = self.get_llm_compact_memory()
         if memory_record is not None:

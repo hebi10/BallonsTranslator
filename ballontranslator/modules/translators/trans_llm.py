@@ -159,6 +159,7 @@ class LLMTranslator(LLMChatRequester, BaseTranslator):
     }
 
     def _setup_translator(self):
+        self.lang_map['Auto'] = 'English/Japanese (auto)'
         self.lang_map['简体中文'] = 'Simplified Chinese'
         self.lang_map['繁體中文'] = 'Traditional Chinese'
         self.lang_map['日本語'] = 'Japanese'
@@ -360,8 +361,10 @@ class LLMTranslator(LLMChatRequester, BaseTranslator):
                 text_list, textblk_lst=textblk_lst, non_empty_ids=non_empty_ids,
                 project=project, page_key=page_key, commit_history_window=commit_history_window,
             )
+        from ballontranslator.utils.local_language import effective_source_language
         dialogue_context = self._snapshot_page_dialogue(
             textblk_lst, non_empty_ids, project, page_key,
+            source_language=effective_source_language(project, page_key, fallback=self.lang_source),
         )
         return self.translate(
             text_list,
@@ -377,6 +380,8 @@ class LLMTranslator(LLMChatRequester, BaseTranslator):
         non_empty_ids: List[int],
         project: Optional[ProjImgTrans],
         page_key: Optional[str],
+        *,
+        source_language: str = 'Auto',
     ) -> PageDialogueContext:
         """Freeze exact block identities before requests can observe page edits.
 
@@ -388,6 +393,12 @@ class LLMTranslator(LLMChatRequester, BaseTranslator):
 
         def snapshot(block: TextBlock, source: str = '', truncated: bool = False) -> DialogueBlock:
             direction = block.src_is_vertical
+            override = getattr(block, 'source_language_override', '')
+            language = (
+                override if override in ('English', '日本語') else
+                source_language if source_language in ('English', '日本語') else
+                getattr(block, 'source_language', 'unknown')
+            )
             return DialogueBlock(
                 page_index=page_indices.get(id(block)),
                 bbox=tuple(int(value) for value in block.xyxy),
@@ -396,6 +407,8 @@ class LLMTranslator(LLMChatRequester, BaseTranslator):
                 ),
                 source=source,
                 source_truncated=truncated,
+                source_language={'English': 'English', '日本語': 'Japanese'}.get(language, 'unknown'),
+                language_review=bool(getattr(block, 'language_review', False)),
             )
 
         inputs = tuple(snapshot(textblk_lst[index]) for index in non_empty_ids)
@@ -493,12 +506,19 @@ class LLMTranslator(LLMChatRequester, BaseTranslator):
             return text
 
         from ballontranslator.utils.local_edition import is_local_edition
-        if is_local_edition() and not empty_page_summary:
+        local_edition = is_local_edition()
+        if local_edition and not empty_page_summary:
             vision_enabled = vision_enabled and self._dialogue_needs_image(dialogue_context)
 
         is_list = isinstance(text, List)
         queries = tuple(text) if is_list else (text,)
         source_language = str(self.lang_source)
+        local_settings = {}
+        if local_edition:
+            from ballontranslator.utils.local_language import effective_source_language
+            source_language = effective_source_language(project, page_key, fallback=source_language)
+            if project is not None:
+                local_settings = getattr(project, 'local_settings', {})
         target_language = str(self.lang_target)
         history_enabled = (
             pcfg.module.llm_translate_context == LLMTranslateContext.HISTORY
@@ -508,6 +528,9 @@ class LLMTranslator(LLMChatRequester, BaseTranslator):
             int(pcfg.module.llm_prior_context_token_budget),
         )
         glossary_path = str(pcfg.module.llm_glossary_path or '')
+        if 'glossary_path' in local_settings:
+            # An explicitly empty project setting disables the inherited glossary.
+            glossary_path = str(local_settings['glossary_path'] or '')
         glossary_mode = pcfg.module.llm_glossary_mode
         overwrite_existing_summary = summary_memory_enabled and bool(
             pcfg.module.llm_translate_overwrite_summary
@@ -533,11 +556,26 @@ class LLMTranslator(LLMChatRequester, BaseTranslator):
         model = self._text_model(profile)
         array_response = profile.backend == 'codex' or gpt_model_version(model) is not None
         target_language_name = self._translated_lang(target_language)
+        source_language_name = self._translated_lang(source_language)
+        if local_edition and dialogue_context is not None and source_language != 'Auto':
+            block_languages = {block.source_language for block in dialogue_context.inputs}
+            if block_languages:
+                source_language_name = (
+                    next(iter(block_languages)) if len(block_languages) == 1
+                    else self._translated_lang('Auto')
+                )
+        profile_prompt = profile.prompt
+        if local_edition:
+            from ballontranslator.utils.local_edition import AUTO_PROMPT, ENGLISH_PROMPT, LOCAL_PROMPT
+            if profile_prompt in (AUTO_PROMPT, ENGLISH_PROMPT, LOCAL_PROMPT):
+                profile_prompt = {
+                    'Japanese': LOCAL_PROMPT, 'English': ENGLISH_PROMPT,
+                }.get(source_language_name, AUTO_PROMPT)
         prompt_spec = TranslationPromptSpec(
-            source_language=self._translated_lang(source_language),
+            source_language=source_language_name,
             target_language=target_language_name,
             system_prompt=translation_system_prompt(
-                profile.prompt,
+                profile_prompt,
                 target_language_name,
                 history_enabled=history_enabled,
                 summary_enabled=request_summary,
@@ -546,6 +584,14 @@ class LLMTranslator(LLMChatRequester, BaseTranslator):
             summary_enabled=request_summary,
             history_enabled=history_enabled,
             array_response=array_response,
+            # Prior pages can use a different source language. Never relabel an
+            # earlier English example as Japanese when this page is overridden.
+            history_source_language=self._translated_lang('Auto') if local_edition else '',
+            work_context=tuple(
+                (key, str(local_settings[key]))
+                for key in ('work_name', 'tone_notes', 'reading_direction')
+                if local_settings.get(key) and local_settings[key] not in ('Auto', 'auto')
+            ),
         )
         vision_request = None
         if (

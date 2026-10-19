@@ -285,3 +285,21 @@ def test_inpaint_result_wrong_shape_rejected_before_translation():
     with pytest.raises(ValueError):
         models.run(make_request())
     assert 'translate' not in models.calls
+
+
+def test_local_region_inherits_manual_override_and_applies_explicit_direction(monkeypatch):
+    request = make_request()
+    request.project.local_settings = {'source_language': 'Auto', 'reading_direction': 'rtl'}
+    request.project.pages['page.png'][1].source_language_override = 'English'
+    models = Models()
+    models.detect_blocks.append(TextBlock([9, 2, 11, 10], lines=[[[9, 2], [11, 2], [11, 10], [9, 10]]]))
+    monkeypatch.setattr('ballontranslator.ui.region_rework.is_local_edition', lambda: True)
+    captured = []
+    def route(ocr, image, blocks, project, page_key, **kwargs):
+        captured.append((page_key, [item.source_language_override for item in blocks], [item.xyxy[0] for item in blocks]))
+        return ocr.run_ocr(image, blocks)
+    monkeypatch.setattr('ballontranslator.ui.region_rework.run_local_ocr', route)
+    result = models.run(request)
+    assert captured == [('page.png', ['', 'English'], [9, 2])]
+    assert [item.source_language_override for item in result.blocks] == ['', 'English']
+    assert request.project.pages['page.png'][1].source_language_override == 'English'

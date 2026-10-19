@@ -34,6 +34,9 @@ from ballontranslator.modules import INPAINTERS, TRANSLATORS, TEXTDETECTORS, OCR
 import ballontranslator.modules as modules
 modules.translators.SYSTEM_LANG = QLocale.system().name()
 from ballontranslator.utils.textblock import TextBlock, sort_regions
+from ballontranslator.utils.local_language import (
+    inherit_source_overrides, order_local_blocks, run_local_ocr,
+)
 from ballontranslator.utils.textblock_mask import region_mask
 from ballontranslator.utils import shared
 from ballontranslator.utils.message import create_error_dialog, create_info_dialog
@@ -242,8 +245,14 @@ class ModuleThread(QThread):
         if spec is None:
             raise KeyError(f'Unknown {self.module_key} module: {module_name}')
         self._emit_prepare_progress({'event': 'checking_dependencies', 'message': self.tr('Checking dependencies')})
-        if not ensure_module_files(spec, progress_callback=self._emit_prepare_progress, cancel_event=self.cancel_event):
-            raise RuntimeError(f'Failed to prepare files for {self.module_key} module: {module_name}')
+        specs = [spec]
+        if self.module_key == 'ocr' and module_name == 'local_auto':
+            specs.extend(self.module_register.get_spec(key) for key in ('manga_ocr', 'mit48px'))
+        for prepared_spec in specs:
+            if prepared_spec is None or not ensure_module_files(
+                prepared_spec, progress_callback=self._emit_prepare_progress, cancel_event=self.cancel_event,
+            ):
+                raise RuntimeError(f'Failed to prepare files for {self.module_key} module: {module_name}')
         if self.cancel_event.is_set():
             raise DownloadCancelled('Module preparation cancelled by user.')
         self._emit_prepare_progress({'event': 'importing', 'message': self.tr('Importing module')})
@@ -937,6 +946,9 @@ class ImgtransThread(QThread):
         if hasattr(translator, 'set_stop_event'):
             translator.set_stop_event(self.stop_event)
         try:
+            from ballontranslator.utils.local_edition import is_local_edition
+            if is_local_edition():
+                unload_modules(self, ['textdetector', 'ocr', 'inpainter'])
             translator.translate_textblk_lst(
                 blk_list,
                 project=project,
@@ -1046,7 +1058,17 @@ class ImgtransThread(QThread):
             if hasattr(ocr_module, 'set_stop_event'):
                 ocr_module.set_stop_event(self.stop_event)
             try:
-                ocr_module.run_ocr(tgt_img, blk_list, split_textblk=True)
+                from ballontranslator.utils.local_edition import is_local_edition
+                if is_local_edition():
+                    from ballontranslator.utils.local_ollama import OllamaClient, LocalOperationCancelled
+                    try:
+                        OllamaClient().unload(stop_event=self.stop_event)
+                    except LocalOperationCancelled as error:
+                        raise LLMRequestStopped(str(error)) from error
+                run_local_ocr(
+                    ocr_module, tgt_img, blk_list, self.imgtrans_proj, page_key,
+                    stop_event=self.stop_event, split_textblk=True,
+                )
             except LLMUserActionRequiredError as e:
                 _show_llm_user_action_required_dialog(
                     e,
@@ -1098,6 +1120,14 @@ class ImgtransThread(QThread):
         if self.isStopRequested():
             return
         if mode > 1:
+            from ballontranslator.utils.local_edition import is_local_edition
+            if is_local_edition():
+                from ballontranslator.utils.local_ollama import OllamaClient, LocalOperationCancelled
+                try:
+                    OllamaClient().unload(stop_event=self.stop_event)
+                except LocalOperationCancelled:
+                    self.finish_blktrans.emit(mode, blk_ids)
+                    return
             if hasattr(self.inpaint_thread.inpainter, 'set_stop_event'):
                 self.inpaint_thread.inpainter.set_stop_event(self.stop_event)
             to_inpaint = self.imgtrans_proj.inpainted_array
@@ -1151,6 +1181,7 @@ class ImgtransThread(QThread):
         self.finish_blktrans.emit(mode, blk_ids)
 
     def _imgtrans_pipeline(self):
+        from ballontranslator.utils.local_edition import is_local_edition
         self.detect_counter = 0
         self.ocr_counter = 0
         self.translate_counter = 0
@@ -1230,6 +1261,8 @@ class ImgtransThread(QThread):
                 self.imgtrans_proj.begin_detection(imgname)
                 try:
                     mask, blk_list = self.textdetector.detect(img, self.imgtrans_proj)
+                    if is_local_edition():
+                        inherit_source_overrides(blk_list, self.imgtrans_proj.pages.get(imgname, []))
                     need_save_mask = True
                 except ModuleRunError as e:
                     self._stop_on_stage_failure(
@@ -1246,6 +1279,8 @@ class ImgtransThread(QThread):
                     existed_mask = self.imgtrans_proj.load_mask_by_imgname(imgname)
                     if existed_mask is not None:
                         mask = np.bitwise_or(mask, existed_mask)
+                if is_local_edition():
+                    blk_list = order_local_blocks(blk_list, self.imgtrans_proj)
                 self.imgtrans_proj.pages[imgname] = blk_list
 
                 if mask is not None:
@@ -1278,7 +1313,10 @@ class ImgtransThread(QThread):
                             full_page=True,
                         )
                     else:
-                        ocr_result = self.ocr.run_ocr(img, blk_list)
+                        ocr_result = run_local_ocr(
+                            self.ocr, img, blk_list, self.imgtrans_proj, imgname,
+                            stop_event=self.stop_event,
+                        )
                     if isinstance(ocr_result, list):
                         blk_list = ocr_result
                     self.imgtrans_proj.pages[imgname] = blk_list
@@ -1704,6 +1742,11 @@ class ModuleManager(QObject):
             if spec is None:
                 continue
             module_specs.append((module_key, module_name, spec))
+            if module_key == 'ocr' and module_name == 'local_auto':
+                for key in ('manga_ocr', 'mit48px'):
+                    child_spec = OCR.get_spec(key)
+                    if child_spec is not None:
+                        module_specs.append(('ocr', key, child_spec))
         return collect_missing_module_requirements(module_specs, create_package_manager())
 
     def _continue_pending_prepare(self) -> None:

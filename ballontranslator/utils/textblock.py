@@ -109,7 +109,11 @@ def normalize_textblock_effect_payload(
 class TextBlock:
     xyxy: List = field(default_factory = lambda: [0, 0, 0, 0])
     lines: List = field(default_factory = lambda: [])
-    language: str = 'unknown'
+    language: str = 'unknown'  # Legacy detector hint; separate from verified OCR language.
+    source_language: str = 'unknown'
+    source_language_override: str = ''
+    ocr_engine: str = ''
+    language_review: str = ''
     # font_size: float = -1.
     distance: np.ndarray = None
     angle: int = 0
@@ -282,6 +286,17 @@ class TextBlock:
         self.fontformat.alignment = value
 
     def __post_init__(self) -> None:
+        for name, values, default in (
+            ('source_language', ('unknown', 'English', '日本語'), 'unknown'),
+            ('source_language_override', ('', 'English', '日本語'), ''),
+        ):
+            if getattr(self, name) not in values:
+                LOGGER.warning('Discard invalid TextBlock.%s value.', name)
+                setattr(self, name, default)
+        for name in ('ocr_engine', 'language_review'):
+            if not isinstance(getattr(self, name), str):
+                LOGGER.warning('Discard invalid TextBlock.%s value: expected text.', name)
+                setattr(self, name, '')
         self.text_alpha_mask = load_text_alpha_mask(self.text_alpha_mask)
         if self.xyxy is not None:
             self.xyxy = [int(num) for num in self.xyxy]

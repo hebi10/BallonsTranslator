@@ -265,6 +265,14 @@ class MainWindow(mainwindow_cls):
         self.local_workspace.run_requested.connect(self.start_local_folder)
         self.local_workspace.pause_requested.connect(self.pause_local_queue)
         self.local_workspace.edit_requested.connect(self.open_local_editor)
+        self.local_workspace.review_requested.connect(self.show_local_review)
+        self.local_workspace.preview_requested.connect(self.start_local_preview)
+        self.local_workspace.settings_changed.connect(self.on_local_settings_changed)
+        self._local_review_dialog = None
+        self._local_review_identity = None
+        self._local_preview_worker = None
+        self._local_preview_active = False
+        self._local_preview_folder = None
         self._local_pending_folder = None
         self._local_render_pending = []
         self._local_resume_pending = False
@@ -276,6 +284,9 @@ class MainWindow(mainwindow_cls):
         self.local_action.triggered.connect(self.show_local_workspace)
         menu = self.titleBar.toolsToolBtn.menu()
         menu.insertAction(menu.actions()[0], self.local_action)
+        self.local_review_action = QAction(self.tr('확인 필요 모아보기'), self)
+        self.local_review_action.triggered.connect(self.show_current_local_review)
+        menu.insertAction(self.local_action, self.local_review_action)
         self.region_rework_action = QAction(self.tr('영역 재작업'), self)
         self.region_rework_action.setShortcut(QKeySequence('Ctrl+Shift+R'))
         self.region_rework_action.triggered.connect(self.begin_region_rework)
@@ -309,14 +320,286 @@ class MainWindow(mainwindow_cls):
         self.bottomBar.ocr_selector.setSelectedValue(pcfg.module.ocr)
         self.setTranslatorSelectionFromMetadata(pcfg.module.translator)
 
-    def open_local_editor(self, folder: str) -> None:
+    def show_current_local_review(self) -> None:
+        if self.imgtrans_proj.directory is not None:
+            self.show_local_review(self.imgtrans_proj.directory)
+
+    def _store_local_project_settings(self, folder: str) -> None:
+        settings = self.local_workspace.folder_settings(folder)
+        self.imgtrans_proj.local_settings = settings
+        self.imgtrans_proj.save()
+
+    def on_local_settings_changed(self, folder: str) -> bool:
+        current = self.imgtrans_proj.directory
+        if current is None or Path(current).resolve() != Path(folder).resolve():
+            return True
+        if self.conditional_save() is False:
+            self.local_workspace.status_label.setText('작품 설정은 저장됐습니다. 현재 편집 결과를 저장한 뒤 폴더를 다시 열면 적용됩니다.')
+            return False
+        before_module = copy.deepcopy(pcfg.module)
+        if self.local_workspace.apply_folder_settings(folder) is None:
+            return False
+        before = copy.deepcopy(self.imgtrans_proj.local_settings)
+        try:
+            self._store_local_project_settings(folder)
+            self._sync_local_source_language()
+            return True
+        except Exception as error:
+            self.imgtrans_proj.local_settings = before
+            pcfg.module = before_module
+            try:
+                save_config()
+            except Exception as config_error:
+                LOGGER.warning('Unable to persist restored work settings: %s', config_error)
+            create_info_dialog(f'현재 프로젝트에 작품 설정을 적용하지 못했습니다: {error}')
+            return False
+
+    def open_local_editor(self, folder: str) -> bool:
         if self.conditional_save() is False:
             create_info_dialog('현재 프로젝트를 저장하지 못했습니다. 저장 오류를 해결한 후 다시 열어 주세요.')
-            return
+            return False
+        if self.local_workspace.apply_folder_settings(folder) is None:
+            return False
         self._sync_local_source_language()
-        self.OpenProj(folder)
+        if not self.openDir(folder):
+            return False
+        if pcfg.let_textstyle_indep_flag and not shared.HEADLESS:
+            self.load_textstyle_from_proj_dir(from_proj=True)
+        try:
+            self._store_local_project_settings(folder)
+        except Exception as error:
+            create_info_dialog(f'작품 설정을 저장하지 못했습니다: {error}')
+            return False
         self._local_output_dir = self.local_workspace.queue.output_directory(folder)
         pcfg.imgsave_ext = self.local_workspace.queue.format
+        return True
+
+    def show_local_review(self, folder: str) -> None:
+        from .local_review_dialog import LocalReviewDialog
+        from ballontranslator.utils.local_review import record_review_issue
+
+        if self._local_pipeline_busy() or self.module_manager.regionReworkBusy():
+            return
+        current = self.imgtrans_proj.directory
+        if current is None or Path(current).resolve() != Path(folder).resolve():
+            if not self.open_local_editor(folder):
+                return
+        self.st_manager.updateTextBlkList()
+        for job in self.local_workspace.queue.jobs:
+            if Path(job['folder']).resolve() == Path(folder).resolve():
+                for page in job.get('review_pages', []):
+                    if page in self.imgtrans_proj.pages:
+                        record_review_issue(self.imgtrans_proj, page, 'layout_hold', '말풍선 안에 글자가 맞는지 확인해 주세요.')
+                break
+        if self._local_review_dialog is None:
+            dialog = self._local_review_dialog = LocalReviewDialog(self)
+            dialog.open_requested.connect(self.open_local_review_item)
+            dialog.acknowledge_requested.connect(self.acknowledge_local_review)
+            dialog.language_requested.connect(self.set_local_review_language)
+        self._local_review_identity = self.imgtrans_proj.load_identity
+        self._refresh_local_review()
+        self.local_workspace.hide()
+        self._local_review_dialog.show()
+        self._local_review_dialog.raise_()
+
+    def _refresh_local_review(self) -> None:
+        from ballontranslator.utils.local_review import collect_review_items
+
+        dialog = getattr(self, '_local_review_dialog', None)
+        if dialog is not None:
+            if self._local_review_identity is not self.imgtrans_proj.load_identity:
+                dialog.hide()
+                return
+            dialog.set_items(collect_review_items(self.imgtrans_proj))
+
+    def _local_review_editable(self) -> bool:
+        return (getattr(self, '_local_review_identity', None) is self.imgtrans_proj.load_identity
+                and not self._local_pipeline_busy() and not self.module_manager.regionReworkBusy()
+                and not self.local_workspace.busy)
+
+    def open_local_review_item(self, page: str, block_index: int) -> None:
+        if not self._local_review_editable() or page not in self.imgtrans_proj.pages:
+            return
+        self.st_manager.updateTextBlkList()
+        if not self._local_review_target_current(page, block_index):
+            return
+        self.pageList.setCurrentRow(self.imgtrans_proj.pagename2idx(page))
+        if self.imgtrans_proj.current_img != page:
+            return
+        self._local_review_dialog.hide()
+        self.bottomBar.paintChecker.setChecked(False)
+        self.bottomBar.texteditChecker.setChecked(True)
+        self.setTextEditMode()
+        items = self.st_manager.textblk_item_list
+        if 0 <= block_index < len(items):
+            self.canvas.clearSelection()
+            items[block_index].setSelected(True)
+            self.canvas.gv.centerOn(items[block_index])
+        self.raise_()
+        self.activateWindow()
+
+    def _local_review_target_current(self, page: str, block_index: int) -> bool:
+        from ballontranslator.utils.local_review import collect_review_items
+
+        selected = self._local_review_dialog._selected_item()
+        valid = (selected is not None and selected['page'] == page
+                 and (block_index == -1 or selected['block_index'] == block_index)
+                 and any(item['key'] == selected['key'] for item in collect_review_items(self.imgtrans_proj)))
+        if not valid:
+            self._refresh_local_review()
+            create_info_dialog('대사나 배치가 바뀌어 검수 목록을 새로 확인했습니다. 항목을 다시 선택해 주세요.')
+        return valid
+
+    def acknowledge_local_review(self, item: dict) -> None:
+        from ballontranslator.utils.local_review import acknowledge_review_item
+
+        if not self._local_review_editable():
+            return
+        self.st_manager.updateTextBlkList()
+        before = copy.deepcopy(self.imgtrans_proj.local_review)
+        if acknowledge_review_item(self.imgtrans_proj, item):
+            try:
+                self.imgtrans_proj.save()
+            except Exception as error:
+                self.imgtrans_proj.local_review = before
+                create_info_dialog(f'확인 상태 저장 실패: {error}')
+        self._refresh_local_review()
+
+    def set_local_review_language(self, page: str, block_index: int, source: str) -> None:
+        from ballontranslator.utils.local_review import record_review_issue
+
+        if (not self._local_review_editable() or page not in self.imgtrans_proj.pages
+                or source not in ('Auto', '日本語', 'English')):
+            return
+        self.st_manager.updateTextBlkList()
+        if not self._local_review_target_current(page, block_index):
+            return
+        blocks = self.imgtrans_proj.pages[page]
+        if block_index < -1 or block_index >= len(blocks):
+            return
+        before_info = copy.deepcopy(self.imgtrans_proj._image_info[page])
+        before_review = copy.deepcopy(self.imgtrans_proj.local_review)
+        targets = blocks if block_index == -1 else [blocks[block_index]]
+        before_blocks = [(block, block.source_language_override, block.language_review) for block in targets]
+        if block_index == -1:
+            self.imgtrans_proj._image_info[page]['local_source_language'] = source
+        for block in targets:
+            block.source_language_override = '' if block_index == -1 or source == 'Auto' else source
+            block.language_review = ''
+        record_review_issue(self.imgtrans_proj, page, 'language_changed',
+                            '원문 언어를 변경했습니다. 해당 영역을 재작업한 뒤 결과를 확인해 주세요.',
+                            None if block_index == -1 else block_index, str(time.time_ns()))
+        try:
+            self.imgtrans_proj.save()
+        except Exception as error:
+            self.imgtrans_proj._image_info[page] = before_info
+            self.imgtrans_proj.local_review = before_review
+            for block, override, reason in before_blocks:
+                block.source_language_override, block.language_review = override, reason
+            create_info_dialog(f'원문 언어 설정 저장 실패: {error}')
+        self._refresh_local_review()
+
+    def start_local_preview(self, image_path: str) -> None:
+        from .local_preview import LocalPreviewCopyThread
+
+        workspace = self.local_workspace
+        if workspace.busy or self._local_pipeline_busy() or self.module_manager.regionReworkBusy():
+            return
+        if self.conditional_save() is False:
+            return
+        self._local_preview_settings = workspace.folder_settings(str(Path(image_path).parent))
+        self._local_preview_active = True
+        self._local_preview_folder = None
+        self._local_preview_error = ''
+        self._local_save_error = ''
+        self._local_preview_started = time.monotonic()
+        self._local_preview_pipeline_flags = {}
+        self._local_preview_project_identity = None
+        self._local_save_errors_before = self.imsave_thread.error_count
+        self._local_job_finished = False
+        workspace.running = True
+        workspace.pause_pending = False
+        workspace.set_controls()
+        workspace.status_label.setText('선택 이미지 1장을 시험용 폴더에 준비하고 있습니다.')
+        worker = self._local_preview_worker = LocalPreviewCopyThread(image_path, self)
+        worker.completed.connect(self._local_preview_copy_ready)
+        worker.failed.connect(self._local_preview_copy_failed)
+        worker.finished.connect(self._local_preview_copy_finished)
+        worker.start()
+        self._local_timer.start()
+
+    def _local_preview_copy_ready(self, folder: str) -> None:
+        self._local_preview_folder = folder
+
+    def _local_preview_copy_failed(self, message: str) -> None:
+        self._local_preview_error = message
+        self._local_job_finished = True
+
+    def _local_preview_copy_finished(self) -> None:
+        worker, self._local_preview_worker = self._local_preview_worker, None
+        if worker is not None:
+            worker.deleteLater()
+
+    def _poll_local_preview(self) -> None:
+        workspace = self.local_workspace
+        if self._local_preview_worker is not None or self.imsave_thread.isBusy():
+            return
+        folder, self._local_preview_folder = self._local_preview_folder, None
+        if folder is not None and not workspace.pause_pending and not self._local_preview_error:
+            try:
+                if self.imsave_thread.error_count != self._local_save_errors_before:
+                    raise OSError('이전 프로젝트 이미지 저장에 실패했습니다.')
+                self._sync_local_source_language()
+                if not self.openDir(folder) or self.imgtrans_proj.is_empty:
+                    raise OSError('시험 이미지를 열지 못했습니다.')
+                self.imgtrans_proj.local_settings = self._local_preview_settings.copy()
+                self.imgtrans_proj.save()
+                self._local_preview_project_identity = self.imgtrans_proj.load_identity
+                self._local_output_dir = Path(self.imgtrans_proj.result_dir())
+                pcfg.imgsave_ext = workspace.queue.format
+                for key in ('enable_detect', 'enable_ocr', 'enable_translate', 'enable_inpaint'):
+                    self._local_preview_pipeline_flags[key] = getattr(pcfg.module, key)
+                    setattr(pcfg.module, key, True)
+                pcfg.module.update_finish_code()
+                workspace.status_label.setText('선택 이미지 1장 시험 · OCR → 번역 → 배경 복원 → 한국어 배치')
+                self.on_run_imgtrans(pages_to_process=list(self.imgtrans_proj.pages))
+            except Exception as error:
+                self._local_preview_error = str(error)
+                self._local_job_finished = True
+            return
+        if workspace.pause_pending:
+            self._local_job_finished = True
+        if not self._local_job_finished or self._local_pipeline_busy():
+            return
+        error = self._local_preview_error or self._local_save_error
+        if self._local_preview_project_identity is self.imgtrans_proj.load_identity:
+            try:
+                self.imgtrans_proj.save()
+            except Exception as save_error:
+                error = f'시험 프로젝트 저장 실패: {save_error}'
+        if self.imsave_thread.error_count != self._local_save_errors_before:
+            error = error or '시험 결과 이미지 저장에 실패했습니다.'
+        if not error and not workspace.pause_pending:
+            project = self.imgtrans_proj
+            if not all(project.get_page_progress(page) and Path(project.get_result_path(page)).is_file() for page in project.pages):
+                error = '일부 처리 단계가 완료되지 않았습니다. 준비 상태와 오류 메시지를 확인해 주세요.'
+        self._local_preview_active = False
+        self._local_output_dir = None
+        self._local_job_finished = False
+        for key, value in self._local_preview_pipeline_flags.items():
+            setattr(pcfg.module, key, value)
+        pcfg.module.update_finish_code()
+        self._local_preview_pipeline_flags = {}
+        workspace.running = False
+        workspace.set_controls()
+        self._local_timer.stop()
+        elapsed = int(time.monotonic() - self._local_preview_started)
+        workspace.status_label.setText(error or ('1장 시험을 중지했습니다.' if workspace.pause_pending else f'1장 전체 시험 완료 · {elapsed}초. 편집 화면에서 원본과 결과를 비교하세요.'))
+        if not error and not workspace.pause_pending:
+            workspace.hide()
+            self.raise_()
+            self.activateWindow()
+            self.show_local_review(self.imgtrans_proj.directory)
 
     def _local_pipeline_busy(self) -> bool:
         manager = self.module_manager
@@ -343,6 +626,8 @@ class MainWindow(mainwindow_cls):
         return None
 
     def _hold_local_layout(self, block_indices: list[int]) -> None:
+        from ballontranslator.utils.local_review import record_review_issue
+
         job = self._local_layout_review_job()
         page = self.imgtrans_proj.current_img
         blocks = ', '.join(str(index + 1) for index in block_indices)
@@ -358,6 +643,8 @@ class MainWindow(mainwindow_cls):
                 error += ' 작업 목록을 저장하지 못했습니다.'
         try:
             self.st_manager.updateTextBlkList()
+            for index in block_indices:
+                record_review_issue(self.imgtrans_proj, page, 'layout_hold', '글자가 말풍선 안에 맞지 않습니다.', index)
             self.imgtrans_proj.save()
             self._llm_context_dirty = False
         except Exception as exc:
@@ -400,6 +687,7 @@ class MainWindow(mainwindow_cls):
             self._local_output_dir = None
             workspace.finish_job(False, '폴더를 열 수 없거나 지원하는 이미지가 없습니다.', 0, 0)
             return
+        self._store_local_project_settings(folder)
         pages = list(self.imgtrans_proj.pages)
         job = workspace.queue.jobs[workspace.active_index]
         if job.get('restart'):
@@ -440,6 +728,9 @@ class MainWindow(mainwindow_cls):
             self.on_run_imgtrans(continue_mode=True)
 
     def pause_local_queue(self) -> None:
+        preview_worker = getattr(self, '_local_preview_worker', None)
+        if preview_worker is not None:
+            preview_worker.stop_event.set()
         self._local_render_pending = []
         self._local_resume_pending = False
         self.module_manager.stopImgtransPipeline()
@@ -451,6 +742,9 @@ class MainWindow(mainwindow_cls):
             self._local_save_error = f'{page}: {message}'
 
     def poll_local_queue(self) -> None:
+        if getattr(self, '_local_preview_active', False):
+            self._poll_local_preview()
+            return
         workspace = self.local_workspace
         if workspace.active_index is None:
             self._local_timer.stop()
@@ -512,6 +806,8 @@ class MainWindow(mainwindow_cls):
                 error = f'결과 이미지 {len(missing)}개가 저장되지 않았습니다. 재시도하면 프로젝트에서 다시 저장합니다.'
         self._local_output_dir = None
         self._local_job_finished = False
+        from ballontranslator.utils.local_review import collect_review_items
+        workspace.queue.jobs[workspace.active_index]['review_count'] = len(collect_review_items(self.imgtrans_proj))
         workspace.finish_job(not workspace.pause_pending and not error and done == len(pages), error, done, len(pages))
 
     def resetStyleSheet(self):
@@ -1943,6 +2239,8 @@ class MainWindow(mainwindow_cls):
             if failed_blocks:
                 self._hold_local_layout(failed_blocks)
                 return False
+            from ballontranslator.utils.local_review import clear_review_issues
+            clear_review_issues(self.imgtrans_proj, self.imgtrans_proj.current_img, 'layout_hold')
 
         if restore_interface:
             set_canvas_focus = self.canvas.hasFocus()
@@ -2266,7 +2564,7 @@ class MainWindow(mainwindow_cls):
         self._render_only = False
         self._render_global_format = None
         workspace = getattr(self, 'local_workspace', None)
-        if workspace is not None and workspace.active_index is not None:
+        if workspace is not None and (workspace.active_index is not None or getattr(self, '_local_preview_active', False)):
             self._local_job_finished = True
         if pcfg.module.empty_runcache and not shared.HEADLESS and not is_local_edition():
             self.module_manager.unload_all_models()
@@ -2655,6 +2953,10 @@ class MainWindow(mainwindow_cls):
         self.llmContextEditor.refresh_context()
         self.global_search_widget.set_document_edited()
         if review_needed:
+            from ballontranslator.utils.local_review import record_review_issue
+            record_review_issue(self.imgtrans_proj, self.imgtrans_proj.current_img,
+                                'background_review', '배경 위 대사의 배치와 복원 결과를 확인해 주세요.',
+                                revision=str(time.time_ns()))
             create_info_dialog(self.tr('선택 영역 재작업을 완료했습니다. 배경 위 대사 등 말풍선 경계를 확인하기 어려운 글자는 배치를 직접 확인해 주세요. Ctrl+Z로 되돌릴 수 있습니다.'))
 
     def on_region_rework_failed(self, message: str) -> None:
@@ -2839,7 +3141,9 @@ class MainWindow(mainwindow_cls):
 
         if enable_detect:
             for page in requested_pages:
-                if not pcfg.module.keep_exist_textlines and not continue_mode:
+                # Local detection matches saved manual language choices before
+                # replacing blocks. Progress is already invalidated above.
+                if not pcfg.module.keep_exist_textlines and not continue_mode and not is_local_edition():
                     self.imgtrans_proj.pages[page].clear()
         elif not continue_mode:
             self.st_manager.updateTextBlkList()
