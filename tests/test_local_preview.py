@@ -1,5 +1,7 @@
+import os
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from PIL import Image
@@ -144,6 +146,56 @@ def test_write_failure_removes_only_new_folder(tmp_path, monkeypatch):
         prepare_preview_image(source, root, threading.Event())
     assert list(root.iterdir()) == [existing.parent]
     assert source.read_bytes() == original
+
+
+def test_stable_source_with_different_path_and_descriptor_ctime_can_be_copied(tmp_path, monkeypatch):
+    source = make_image(tmp_path / 'source.png')
+    original_fstat = os.fstat
+
+    def descriptor_stat(fd):
+        result = original_fstat(fd)
+        # Windows Python 3.12 path-stat reports creation time, while fstat
+        # reports metadata change time. Neither value changes during this copy.
+        return SimpleNamespace(**{
+            name: getattr(result, name) + (1 if name == 'st_ctime_ns' else 0)
+            for name in ('st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_ctime_ns')
+        })
+
+    monkeypatch.setattr(os, 'fstat', descriptor_stat)
+    folder = prepare_preview_image(source, tmp_path / 'previews', threading.Event())
+    assert (folder / 'preview.png').read_bytes() == source.read_bytes()
+
+
+def test_same_size_content_change_with_restored_mtime_is_rejected(tmp_path, monkeypatch):
+    source = make_image(tmp_path / 'source.png')
+    original = source.read_bytes()
+    before = source.stat()
+    root = tmp_path / 'previews'
+    original_stat = Path.stat
+
+    def path_stat(path, *args, **kwargs):
+        result = original_stat(path, *args, **kwargs)
+        if path != source:
+            return result
+        # Match Windows path-stat: creation time does not reveal this rewrite.
+        return SimpleNamespace(**{
+            name: before.st_ctime_ns if name == 'st_ctime_ns' else getattr(result, name)
+            for name in ('st_mode', 'st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_ctime_ns')
+        })
+
+    def rewrite_source():
+        source.write_bytes(original[:-1] + bytes([original[-1] ^ 1]))
+        os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns))
+
+    monkeypatch.setattr(Path, 'stat', path_stat)
+    change_after_read(monkeypatch, source, rewrite_source)
+    with pytest.raises(RuntimeError, match='변경'):
+        prepare_preview_image(source, root, threading.Event())
+    monkeypatch.undo()
+    assert source.stat().st_size == before.st_size
+    assert source.stat().st_mtime_ns == before.st_mtime_ns
+    assert source.read_bytes() != original
+    assert list(root.iterdir()) == []
 
 
 def test_worker_runs_copy_and_uses_config_preview_root(tmp_path, monkeypatch):

@@ -153,7 +153,12 @@ def begin_preview(host, monkeypatch, app):
     assert worker.wait(3000)
     app.processEvents()
     assert host._local_preview_worker is None
+    assert not host._local_preview_error, host._local_preview_error
+    assert host._local_preview_folder is not None, host.local_workspace.status_label.text()
     host.poll_local_queue()
+    assert host._local_preview_active, host.local_workspace.status_label.text()
+    assert not host._local_preview_error, host._local_preview_error
+    assert host.module_manager.runImgtransPipeline.call_count == 1, host.local_workspace.status_label.text()
     return source
 
 

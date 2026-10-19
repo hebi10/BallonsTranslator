@@ -42,8 +42,10 @@ def prepare_preview_image(
     if not stat.S_ISREG(before.st_mode):
         raise ValueError('미리보기 원본은 이미지 파일이어야 합니다.')
 
-    # Exclude access time, which reading the source can legitimately change.
-    attributes = ('st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_ctime_ns')
+    # Access time can change during reads. On Windows Python 3.12+, path-stat
+    # ctime means creation time while fstat ctime can mean metadata change time;
+    # compare it only against a baseline obtained through the same API.
+    attributes = ('st_dev', 'st_ino', 'st_size', 'st_mtime_ns')
     expected = tuple(getattr(before, name) for name in attributes)
     folder: Optional[Path] = None
     try:
@@ -65,8 +67,9 @@ def prepare_preview_image(
                     if not chunk:
                         break
                     writer.write(chunk)
-            for after in (os.fstat(reader.fileno()), source.stat()):
-                if tuple(getattr(after, name) for name in attributes) != expected:
+            for baseline, after in ((opened, os.fstat(reader.fileno())), (before, source.stat())):
+                if any(getattr(after, name) != getattr(baseline, name)
+                       for name in (*attributes, 'st_ctime_ns')):
                     raise RuntimeError('복사 중 원본 이미지가 변경되었습니다. 다시 시도하세요.')
             if stop_event.is_set():
                 raise RuntimeError('미리보기 준비가 취소되었습니다.')

@@ -260,7 +260,7 @@ class LocalWorkspaceTest(unittest.TestCase):
         self.assertEqual(restored['review_pages'], ['page.png'])
         self.assertFalse(restored.get('restart'))
         self.assertEqual(self.dialog.folder_settings(str(folder))['tone_notes'], '반말을 유지')
-        self.assertEqual(changed, [str(folder)])
+        self.assertEqual(changed, [str(folder.resolve())])
 
     def test_named_work_reuse_is_explicit_and_does_not_copy_another_work_history(self):
         self._add_folder('next-volume')
@@ -302,12 +302,12 @@ class LocalWorkspaceTest(unittest.TestCase):
             self.assertEqual(pcfg.module.local_tone_notes, '반말')
             self.assertEqual(pcfg.module.local_reading_direction, 'ltr')
             self.assertEqual(pcfg.module.llm_glossary_path, '/a.csv')
-        self.assertEqual(requested, [str(image)])
+        self.assertEqual(requested, [str(image.resolve())])
         outside = Path(self.tmp.name) / 'outside.png'
         outside.write_bytes(b'image')
         with patch('ballontranslator.ui.local_workspace.QFileDialog.getOpenFileName', return_value=(str(outside), '')):
             self.dialog.preview_selected()
-        self.assertEqual(requested, [str(image)])
+        self.assertEqual(requested, [str(image.resolve())])
 
     def test_parent_save_precedes_folder_settings_and_failure_blocks_action(self):
         from ballontranslator.utils.config import pcfg
@@ -342,7 +342,7 @@ class LocalWorkspaceTest(unittest.TestCase):
         requested = []
         self.dialog.review_requested.connect(requested.append)
         self.dialog.review_selected()
-        self.assertEqual(requested, [str(folder)])
+        self.assertEqual(requested, [str(folder.resolve())])
         parent.conditional_save.assert_not_called()
         self.dialog.setParent(None)
 
