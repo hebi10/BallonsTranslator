@@ -172,6 +172,33 @@ def test_ui_screenshots_and_small_window(app, book, tmp_path):
     QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
 
 
+def test_reader_long_folder_name_fits_small_window_with_large_font(app, book, tmp_path):
+    original_font = app.font()
+    font = QFont(original_font)
+    font.setPointSize(12)
+    app.setFont(font)
+    folder = tmp_path / 'English_Japanese_Mixed_Comic_Chapter_One_Extended_Collected_Edition'
+    folder.mkdir()
+    named_book = Book(folder, book.result_dir, book.pages)
+    dialog = ReaderDialog(named_book, ReaderHistory(tmp_path / 'long-name-history.json'))
+    try:
+        dialog.resize(760, 560)
+        dialog.show()
+        until(app, lambda: bool(dialog.canvas.cache))
+        assert dialog.layout().minimumSize().width() <= dialog.width()
+        assert dialog.title_label.text().endswith('…')
+        assert folder.name in dialog.title_label.toolTip()
+        assert folder.name in dialog.title_label.accessibleName()
+        dialog.next_page()
+        assert dialog.current_row == 1
+        root = Path(os.environ.get('READER_SCREENSHOT_DIR', str(tmp_path)))
+        root.mkdir(parents=True, exist_ok=True)
+        assert dialog.grab().save(str(root / 'reader-long-name.png'))
+    finally:
+        close_reader(app, dialog)
+        app.setFont(original_font)
+
+
 def test_workspace_has_guarded_reader_entry_points(app, tmp_path):
     from ballontranslator.ui.local_workspace import LocalWorkspace
     d = LocalWorkspace(queue_path=tmp_path / 'jobs.json')

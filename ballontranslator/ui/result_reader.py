@@ -12,7 +12,7 @@ from qtpy.QtGui import QImage, QImageReader, QPainter, QPalette, QKeySequence
 from qtpy.QtWidgets import (
     QApplication, QAbstractScrollArea, QComboBox, QDialog, QFrame,
     QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QPushButton, QSpinBox,
-    QSplitter, QVBoxLayout, QWidget,
+    QSizePolicy, QSplitter, QVBoxLayout, QWidget,
 )
 from qtpy.QtWidgets import QShortcut
 
@@ -31,6 +31,23 @@ def action_button(text: str, slot, parent=None) -> QPushButton:
     button.setMinimumHeight(40)
     button.clicked.connect(slot)
     return button
+
+
+class ReaderTitleLabel(QLabel):
+    """Keep long folder names readable without expanding the reader window."""
+
+    def __init__(self, text: str, parent=None) -> None:
+        super().__init__(text, parent)
+        self.setTextFormat(Qt.TextFormat.PlainText)
+        self.setToolTip(text)
+        self.setAccessibleName(text)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self.setText(self.fontMetrics().elidedText(
+            self.toolTip(), Qt.TextElideMode.ElideRight, self.width(),
+        ))
 
 
 def size_dialog(dialog: QDialog, width: int, height: int) -> None:
@@ -297,7 +314,7 @@ class ReaderDialog(QDialog):
         root.setContentsMargins(20, 16, 20, 16)
         root.setSpacing(10)
         heading = QHBoxLayout()
-        title = plain_label(f'{book.folder.name} · {len(book.pages)}페이지', self)
+        title = self.title_label = ReaderTitleLabel(f'{book.folder.name} · {len(book.pages)}페이지', self)
         font = title.font(); font.setPointSize(font.pointSize() + 3); font.setBold(True); title.setFont(font)
         heading.addWidget(title, 1)
         heading.addWidget(action_button('이미지 합치기', self.open_merge, self))
