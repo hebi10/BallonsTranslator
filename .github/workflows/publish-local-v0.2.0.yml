@@ -1,0 +1,62 @@
+name: Publish local Windows v0.2.0
+
+on:
+  push:
+    branches: ['release/local-v0.2.0']
+    paths: ['.github/workflows/publish-local-v0.2.0.yml']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-local-v0.2.0
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      actions: read
+    env:
+      SOURCE_SHA: fba78b8f98a0317cec9d18ba02661059548c26a4
+      VALIDATED_RUN: '39187213837'
+      RELEASE_TAG: local-v0.2.0
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify the Windows-tested source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          result=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$VALIDATED_RUN" --jq '.head_sha + " " + .conclusion + " " + .path')
+          test "$result" = "$SOURCE_SHA success .github/workflows/local-windows.yml"
+          existing=$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$RELEASE_TAG" --jq 'length')
+          test "$existing" = 0
+      - name: Build and check package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/build_local_package.py --output release/BallonsTranslator-Local-Windows-source.zip
+          python -m zipfile -t release/BallonsTranslator-Local-Windows-source.zip
+          cd release
+          sha256sum BallonsTranslator-Local-Windows-source.zip > SHA256SUMS.txt
+      - name: Publish the verified package
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "$RELEASE_TAG" release/BallonsTranslator-Local-Windows-source.zip release/SHA256SUMS.txt \
+            --repo "$GITHUB_REPOSITORY" --target "$SOURCE_SHA" --draft --prerelease \
+            --title 'Windows 로컬 번역판 v0.2.0 · 자동 언어 인식·검수·통합 뷰어' --notes-file doc/LOCAL_V020_RELEASE.md
+          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease --latest=false
