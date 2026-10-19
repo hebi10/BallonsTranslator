@@ -13,7 +13,7 @@ def test_profile_is_fixed_local_and_does_not_mutate_existing_config_file(tmp_pat
     config = ProgramConfig()
     local_edition.apply_local_profile(config)
     assert (config.module.textdetector, config.module.ocr, config.module.inpainter,
-            config.module.translator) == ('ctd', 'manga_ocr', 'lama_large_512px', 'LLMTranslator')
+            config.module.translator) == ('ctd', 'local_auto', 'lama_large_512px', 'LLMTranslator')
     assert config.module.translate_target == '한국어'
     assert len(config.module.llm_profiles) == 1
     profile = config.module.llm_profiles[0]
@@ -81,7 +81,7 @@ from ballontranslator.modules import GET_VALID_TRANSLATORS, GET_VALID_OCR, GET_V
 print(json.dumps([GET_VALID_TRANSLATORS(), GET_VALID_OCR(), GET_VALID_INPAINTERS(), TRANSLATORS.get_spec('LLMTranslator').dependencies]))
 '''], text=True, capture_output=True, check=True)
     assert json.loads(result.stdout.strip().splitlines()[-1]) == [
-        ['LLMTranslator'], ['manga_ocr', 'mit48px'], ['lama_large_512px'], []]
+        ['LLMTranslator'], ['local_auto', 'manga_ocr', 'mit48px'], ['lama_large_512px'], []]
 
 
 def test_local_requester_uses_native_client_without_openai():
@@ -142,7 +142,7 @@ def test_english_profile_selects_mit_ocr_and_reuses_qwen_model():
     assert 'Japanese comic dialogue' in config.module.llm_profiles[0].prompt
 
 
-def test_invalid_source_falls_back_to_japanese_and_custom_prompt_is_retained():
+def test_invalid_source_falls_back_to_auto_and_custom_prompt_is_retained():
     config = ProgramConfig()
     local_edition.apply_local_profile(config)
     config.module.llm_profiles[0].prompt = 'Custom character glossary instructions.'
@@ -151,8 +151,8 @@ def test_invalid_source_falls_back_to_japanese_and_custom_prompt_is_retained():
     assert config.module.llm_profiles[0].prompt == 'Custom character glossary instructions.'
     config.module.translate_source = 'invalid'
     local_edition.apply_local_profile(config)
-    assert config.module.translate_source == '日本語'
-    assert config.module.ocr == 'manga_ocr'
+    assert config.module.translate_source == 'Auto'
+    assert config.module.ocr == 'local_auto'
 
 
 def test_readiness_checks_only_selected_ocr(monkeypatch):
@@ -171,3 +171,41 @@ def test_readiness_checks_only_selected_ocr(monkeypatch):
     with patch('ballontranslator.utils.local_edition._model_files_present', return_value=False):
         rows_ja = local_edition.local_readiness('日本語')
     assert '일본어 인식' in rows_ja[1][0]
+
+
+def test_auto_prepares_and_checks_both_local_ocr_models(monkeypatch):
+    from threading import Event
+    import ballontranslator.modules.prepare_local_files as preparation
+    checked = []
+    prepared = []
+    monkeypatch.setattr(preparation, '_missing_module_requirements', lambda spec: [])
+    monkeypatch.setattr(local_edition, '_model_files_present', lambda spec: checked.append(spec.key) or True)
+    monkeypatch.setattr(preparation, 'ensure_module_files', lambda spec, **kwargs: prepared.append(spec.key) or True)
+    rows = local_edition.local_readiness('Auto')
+    assert len(rows) == 5
+    assert {'manga_ocr', 'mit48px'}.issubset(checked)
+    local_edition.prepare_local_models(lambda message: None, Event(), 'Auto')
+    assert {'manga_ocr', 'mit48px'}.issubset(prepared)
+    assert len(prepared) == len(set(prepared))
+
+
+def test_explicit_manual_japanese_survives_initial_profile_activation():
+    config = ProgramConfig()
+    local_edition.apply_local_profile(config, '日本語')
+    assert config.module.translate_source == '日本語'
+    assert config.module.ocr == 'manga_ocr'
+    local_edition.apply_local_profile(config)
+    assert config.module.translate_source == '日本語'
+
+
+def test_auto_registry_is_lazy_and_does_not_import_ocr_weights():
+    result = subprocess.run([sys.executable, '-c', """
+import sys
+from ballontranslator.modules import OCR
+spec = OCR.get_spec('local_auto')
+assert spec is not None and spec.metadata_warnings == []
+assert 'ballontranslator.modules.ocr.ocr_local_auto' not in sys.modules
+assert 'ballontranslator.modules.ocr.ocr_manga' not in sys.modules
+assert 'ballontranslator.modules.ocr.ocr_mit' not in sys.modules
+"""], text=True, capture_output=True)
+    assert result.returncode == 0, result.stderr

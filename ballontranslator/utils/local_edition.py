@@ -10,8 +10,8 @@ from .local_ollama import MODEL_TAG
 
 _active = False
 LOCAL_PROFILE_ID = 'hebi-local-qwen'
-LOCAL_SOURCE_OCR = {'日本語': 'manga_ocr', 'English': 'mit48px'}
-LOCAL_MODULES = {'textdetector': 'ctd', 'ocr': 'manga_ocr',
+LOCAL_SOURCE_OCR = {'Auto': 'local_auto', '日本語': 'manga_ocr', 'English': 'mit48px'}
+LOCAL_MODULES = {'textdetector': 'ctd', 'ocr': 'local_auto',
                  'inpainter': 'lama_large_512px', 'translator': 'LLMTranslator'}
 LOCAL_PROMPT = (
     'Translate Japanese comic dialogue into natural Korean. Preserve every line, meaning, '
@@ -22,12 +22,13 @@ LOCAL_PROMPT = (
     'Return exactly the requested JSON, with one translation per input id and no explanations.'
 )
 ENGLISH_PROMPT = LOCAL_PROMPT.replace('Japanese comic dialogue', 'English comic dialogue')
+AUTO_PROMPT = LOCAL_PROMPT.replace('Japanese comic dialogue', 'English and Japanese comic dialogue, including mixed-language pages,')
 
 
 def local_modules_for_source(source_language: str) -> dict:
     """Choose the offline OCR for the selected language."""
     modules = LOCAL_MODULES.copy()
-    modules['ocr'] = LOCAL_SOURCE_OCR.get(source_language, LOCAL_SOURCE_OCR['日本語'])
+    modules['ocr'] = LOCAL_SOURCE_OCR.get(source_language, LOCAL_SOURCE_OCR['Auto'])
     return modules
 
 
@@ -50,18 +51,25 @@ def module_allowed(module_type: str, key: str) -> bool:
     return LOCAL_MODULES.get(module_type) == key
 
 
-def apply_local_profile(config) -> None:
+def apply_local_profile(config, source_language: str = None) -> None:
     """Constrain this edition's config without touching previous on-disk settings.
 
     >>> LOCAL_MODULES['ocr']
-    'manga_ocr'
+    'local_auto'
     """
     from .llm_profiles import LLMProfile, THINKING_DISABLED
     module = config.module
-    source_language = module.translate_source if module.translate_source in LOCAL_SOURCE_OCR else '日本語'
     previous = next((p for p in module.llm_profiles if p.id == LOCAL_PROFILE_ID), None)
-    default_prompt = ENGLISH_PROMPT if source_language == 'English' else LOCAL_PROMPT
-    custom_prompt = previous.prompt if previous and previous.prompt not in (LOCAL_PROMPT, ENGLISH_PROMPT) else None
+    # Fresh installs start in Auto; previous local manual choices remain explicit.
+    explicit_source = source_language is not None
+    if source_language is None:
+        source_language = module.translate_source if module.translate_source in LOCAL_SOURCE_OCR else 'Auto'
+    if source_language not in LOCAL_SOURCE_OCR:
+        raise ValueError('지원하지 않는 원문 언어입니다.')
+    if not explicit_source and previous is None and source_language == '日本語':
+        source_language = 'Auto'
+    default_prompt = {'English': ENGLISH_PROMPT, '日本語': LOCAL_PROMPT}.get(source_language, AUTO_PROMPT)
+    custom_prompt = previous.prompt if previous and previous.prompt not in (LOCAL_PROMPT, ENGLISH_PROMPT, AUTO_PROMPT) else None
     profile = LLMProfile(
         id=LOCAL_PROFILE_ID, name='로컬 번역 · Qwen3.5 9B', backend='openai',
         base_url='http://127.0.0.1:11435/v1', require_api_key=False,
@@ -109,20 +117,24 @@ def _model_files_present(spec) -> bool:
 
 
 def local_readiness(source_language: str = None) -> List[Tuple[str, bool, str]]:
-    """Check only the selected OCR and shared offline models, without downloads."""
+    """Check selected OCR models (both in Auto) without downloads."""
     from ballontranslator.modules import MODULETYPE_TO_REGISTRIES
     from ballontranslator.modules.prepare_local_files import _missing_module_requirements
     from .config import pcfg
     selected = source_language or pcfg.module.translate_source
     modules = local_modules_for_source(selected)
-    ocr_label = '영어 인식 · MIT 48px' if selected == 'English' else '일본어 인식 · manga_ocr'
-    labels = {'textdetector': '대사 검출 · CTD', 'ocr': ocr_label,
+    labels = {'textdetector': '대사 검출 · CTD',
               'inpainter': '원문 제거 · LaMa', 'translator': '번역 연결 구성'}
+    entries = [(kind, key) for kind, key in modules.items() if kind != 'ocr']
+    engines = ('manga_ocr', 'mit48px') if modules['ocr'] == 'local_auto' else (modules['ocr'],)
+    entries[1:1] = [('ocr', engine) for engine in engines]
     result = []
-    for kind, key in modules.items():
+    for kind, key in entries:
+        label = ({'manga_ocr': '일본어 인식 · manga_ocr', 'mit48px': '영어 인식 · MIT 48px'}[key]
+                 if kind == 'ocr' else labels[kind])
         spec = MODULETYPE_TO_REGISTRIES[kind].get_spec(key)
         if spec is None:
-            result.append((labels[kind], False, '필수 모듈이 없습니다. 프로그램 파일을 다시 확인해 주세요.'))
+            result.append((label, False, '필수 모듈이 없습니다. 프로그램 파일을 다시 확인해 주세요.'))
             continue
         missing = _missing_module_requirements(spec)
         files_ready = _model_files_present(spec)
@@ -131,7 +143,7 @@ def local_readiness(source_language: str = None) -> List[Tuple[str, bool, str]]:
             detail = '필수 실행 구성 설치 필요'
         elif not files_ready:
             detail = '모델 파일 다운로드 필요'
-        result.append((labels[kind], not missing and files_ready, detail))
+        result.append((label, not missing and files_ready, detail))
     return result
 
 
@@ -143,7 +155,10 @@ def prepare_local_models(progress: Callable[[str], None], stop_event: threading.
     from .py_package_manager import PyPackageManager
     from .local_ollama import LocalOperationCancelled
     modules = local_modules_for_source(source_language or pcfg.module.translate_source)
-    specs = [MODULETYPE_TO_REGISTRIES[kind].get_spec(key) for kind, key in modules.items()]
+    specs = [MODULETYPE_TO_REGISTRIES[kind].get_spec(key) for kind, key in modules.items()
+             if kind != 'ocr' or key != 'local_auto']
+    if modules['ocr'] == 'local_auto':
+        specs.extend(MODULETYPE_TO_REGISTRIES['ocr'].get_spec(key) for key in ('manga_ocr', 'mit48px'))
     if any(spec is None for spec in specs):
         raise RuntimeError('필수 모듈이 누락되었습니다. 프로그램을 다시 설치해 주세요.')
     missing = list(dict.fromkeys(item.requirement for spec in specs for item in _missing_module_requirements(spec)))

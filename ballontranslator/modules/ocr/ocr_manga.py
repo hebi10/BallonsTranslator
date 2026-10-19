@@ -11,9 +11,9 @@ from .base import OCRBase, register_OCR, DEFAULT_DEVICE, DEVICE_SELECTOR, TextBl
 MANGA_OCR_PATH = r'data/models/manga-ocr-base'
 class MangaOcr:
     def __init__(self, pretrained_model_name_or_path=MANGA_OCR_PATH, device='cpu'):
-        self.feature_extractor = AutoFeatureExtractor.from_pretrained(pretrained_model_name_or_path)
-        self.tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path)
-        self.model = VisionEncoderDecoderModel.from_pretrained(pretrained_model_name_or_path)
+        self.feature_extractor = AutoFeatureExtractor.from_pretrained(pretrained_model_name_or_path, local_files_only=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path, local_files_only=True)
+        self.model = VisionEncoderDecoderModel.from_pretrained(pretrained_model_name_or_path, local_files_only=True)
         self.to(device)
         
     def to(self, device):

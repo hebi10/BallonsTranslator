@@ -3,7 +3,7 @@ name: Local Windows bootstrap package
 on:
   workflow_dispatch:
   push:
-    branches: ['hebi-local', 'codex/**']
+    branches: ['dev', 'hebi-local', 'codex/**']
     paths:
       - 'ballontranslator/**'
       - 'scripts/**'
@@ -56,7 +56,7 @@ jobs:
       - name: Verify Korean typesetting and region rework with Qt 5
         env:
           QT_API: pyqt5
-        run: python scripts/run_local_regressions.py --files tests/test_korean_segmentation.py tests/test_korean_layout.py tests/test_local_workspace.py tests/test_region_rework_ui.py tests/test_region_rework_undo.py tests/test_region_rework_window.py tests/test_region_rework_lifecycle.py
+        run: python scripts/run_local_regressions.py --files tests/test_korean_segmentation.py tests/test_korean_layout.py tests/test_local_workspace.py tests/test_local_review.py tests/test_local_preview.py tests/test_local_workflow.py tests/test_reader_export.py tests/test_result_reader_ui.py tests/test_region_rework_ui.py tests/test_region_rework_undo.py tests/test_region_rework_window.py tests/test_region_rework_lifecycle.py
       - name: Build source and bootstrap package
         run: python scripts/build_local_package.py --output release/BallonsTranslator-Local-Windows-source.zip
       - name: Upload Windows source/bootstrap ZIP

@@ -119,6 +119,9 @@ class ModuleConfig(Config):
     llm_glossary_mode: str = LLMGlossaryMode.Matching
     llm_translate_vision: bool = False
     local_visual_context: bool = True
+    local_reading_direction: str = 'auto'
+    local_work_name: str = ''
+    local_tone_notes: str = ''
     llm_translate_summary_memory: bool = False
     llm_translate_overwrite_summary: bool = False
 
@@ -215,6 +218,13 @@ class ModuleConfig(Config):
                     f'Discard invalid module.{setting_name} config: expected a boolean.'
                 )
                 setattr(self, setting_name, default)
+        if self.local_reading_direction not in ('auto', 'rtl', 'ltr'):
+            LOGGER.warning('Discard invalid module.local_reading_direction config.')
+            self.local_reading_direction = 'auto'
+        for setting_name in ('local_work_name', 'local_tone_notes'):
+            if not isinstance(getattr(self, setting_name), str):
+                LOGGER.warning('Discard invalid module.%s config: expected text.', setting_name)
+                setattr(self, setting_name, '')
         if self.ocr_text_postprocess not in OCRTextPostprocess.Valid:
             self.ocr_text_postprocess = OCRTextPostprocess.NONE
         if self.translate_context not in TranslateContext.Valid:

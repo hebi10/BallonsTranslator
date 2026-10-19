@@ -13,6 +13,8 @@ import numpy as np
 from ballontranslator.modules.exceptions import LLMRequestStopped
 from ballontranslator.utils.proj_imgtrans import ProjImgTrans
 from ballontranslator.utils.textblock import TextBlock
+from ballontranslator.utils.local_language import inherit_source_overrides, order_local_blocks, run_local_ocr
+from ballontranslator.utils.local_edition import is_local_edition
 
 if TYPE_CHECKING:
     from ballontranslator.modules.inpaint.base import InpainterBase
@@ -97,8 +99,14 @@ def rework_region(
     if detected_mask is None or detected_mask.shape != (y2 - y1, x2 - x1):
         raise ValueError('선택 영역의 텍스트 마스크를 생성하지 못했습니다.')
     blocks = copy.deepcopy(blocks)
+    if is_local_edition():
+        inherit_source_overrides(blocks, [page[index] for index in request.replaced_indices], (x1, y1))
+        blocks = order_local_blocks(blocks, request.project)
     stage_progress('ocr', 0)
-    recognized = ocr.run_ocr(image[y1:y2, x1:x2].copy(), blocks)
+    recognized = run_local_ocr(
+        ocr, image[y1:y2, x1:x2].copy(), blocks, request.project, request.page_key,
+        stop_event=stop_event,
+    )
     if isinstance(recognized, list):
         blocks = recognized
     stage_progress('ocr', 100)

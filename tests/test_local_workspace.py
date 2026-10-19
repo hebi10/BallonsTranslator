@@ -10,9 +10,9 @@ from unittest.mock import Mock, patch
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 
 from qtpy.QtCore import QCoreApplication, QEvent
-from qtpy.QtWidgets import QApplication
+from qtpy.QtWidgets import QApplication, QDialog, QWidget
 
-from ballontranslator.ui.local_workspace import LocalJobQueue, LocalSetupThread, LocalWorkspace
+from ballontranslator.ui.local_workspace import LocalFolderSettingsDialog, LocalJobQueue, LocalSetupThread, LocalWorkspace
 
 
 class LocalQueueTest(unittest.TestCase):
@@ -90,6 +90,39 @@ class LocalQueueTest(unittest.TestCase):
         self.assertEqual(queue.jobs[0]['review_pages'], [])
         self.assertTrue(queue.warning)
 
+    def test_new_folders_default_auto_and_old_language_choices_survive(self):
+        queue = LocalJobQueue(self.path)
+        queue.add([str(self.folder)])
+        self.assertEqual(queue.jobs[0]['source_language'], 'Auto')
+        queue.jobs[0].update(source_language='English', reading_direction='ltr',
+                             work_name='Work A', glossary_path='/a.csv', tone_notes='반말')
+        queue.save()
+        restored = LocalJobQueue(self.path)
+        self.assertEqual(restored.jobs[0]['source_language'], 'English')
+        self.assertEqual(restored.jobs[0]['work_name'], 'Work A')
+        self.assertEqual(restored.jobs[0]['tone_notes'], '반말')
+        self.assertEqual(restored.jobs[0]['reading_direction'], 'ltr')
+        self.assertEqual(restored.jobs[0]['glossary_path'], '/a.csv')
+
+    def test_invalid_folder_settings_are_discarded_independently_without_write(self):
+        content = {'version': 1, 'jobs': [{
+            'folder': str(self.folder), 'state': 'done', 'source_language': [],
+            'reading_direction': 'diagonal', 'work_name': 4, 'glossary_path': {},
+            'tone_notes': 'keep these notes', 'review_count': True,
+        }]}
+        self.path.write_text(json.dumps(content), encoding='utf-8')
+        queue = LocalJobQueue(self.path)
+        self.assertTrue(queue.warning)
+        job = queue.jobs[0]
+        self.assertEqual(job['state'], 'done')
+        self.assertEqual(job['source_language'], '日本語')
+        self.assertEqual(job['reading_direction'], 'auto')
+        self.assertEqual(job['work_name'], '')
+        self.assertEqual(job['glossary_path'], '')
+        self.assertEqual(job['tone_notes'], 'keep these notes')
+        self.assertEqual(job['review_count'], 0)
+        self.assertEqual(json.loads(self.path.read_text(encoding='utf-8')), content)
+
 
 class LocalWorkspaceTest(unittest.TestCase):
     @classmethod
@@ -99,6 +132,9 @@ class LocalWorkspaceTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
+        save_patcher = patch('ballontranslator.ui.local_workspace.save_config', return_value=True)
+        save_patcher.start()
+        self.addCleanup(save_patcher.stop)
         self.dialog = LocalWorkspace(queue_path=Path(self.tmp.name) / 'queue.json')
         self.addCleanup(self.dialog.deleteLater)
 
@@ -182,16 +218,170 @@ class LocalWorkspaceTest(unittest.TestCase):
         restored = LocalJobQueue(self.dialog.queue.path)
         self.assertEqual(restored.jobs[0]['source_language'], '日本語')
 
-    def test_readiness_table_shows_all_rows_without_vertical_scrolling(self):
+    def _add_folder(self, name='comic', source='Auto'):
+        folder = Path(self.tmp.name) / name
+        folder.mkdir()
+        self.dialog.queue.add([str(folder)], source_language=source)
+        self.dialog.refresh_queue()
+        self.dialog.table.selectRow(len(self.dialog.queue.jobs) - 1)
+        return folder
+
+    def test_existing_language_activation_keeps_new_folder_default_auto(self):
+        from ballontranslator.utils.config import pcfg
+        import copy
+        folder = self._add_folder(source='日本語')
+        with patch.object(pcfg, 'module', copy.deepcopy(pcfg.module)), patch(
+            'ballontranslator.ui.local_workspace.save_config', return_value=True,
+        ):
+            self.assertIsNotNone(self.dialog.apply_folder_settings(str(folder)))
+            self.assertEqual(pcfg.module.translate_source, '日本語')
+            self.assertEqual(self.dialog.source_combo.currentData(), 'Auto')
+
+    def test_folder_settings_update_does_not_restart_completed_manual_work(self):
+        folder = self._add_folder()
+        job = self.dialog.queue.jobs[0]
+        job.update(state='done', done=3, total=3, review_pages=['page.png'], resave=False)
+        changed = []
+        self.dialog.settings_changed.connect(changed.append)
+
+        def change_settings(dialog):
+            dialog.source_combo.setCurrentIndex(dialog.source_combo.findData('English'))
+            dialog.direction_combo.setCurrentIndex(dialog.direction_combo.findData('ltr'))
+            dialog.work_edit.setText('Work A')
+            dialog.tone_edit.setPlainText('반말을 유지')
+            return QDialog.DialogCode.Accepted
+
+        with patch.object(LocalFolderSettingsDialog, 'exec_', change_settings):
+            self.dialog.edit_folder_settings()
+        restored = LocalJobQueue(self.dialog.queue.path).jobs[0]
+        self.assertEqual(restored['source_language'], 'English')
+        self.assertEqual(restored['state'], 'done')
+        self.assertEqual(restored['done'], 3)
+        self.assertEqual(restored['review_pages'], ['page.png'])
+        self.assertFalse(restored.get('restart'))
+        self.assertEqual(self.dialog.folder_settings(str(folder))['tone_notes'], '반말을 유지')
+        self.assertEqual(changed, [str(folder)])
+
+    def test_named_work_reuse_is_explicit_and_does_not_copy_another_work_history(self):
+        self._add_folder('next-volume')
+        current = self.dialog.queue.jobs[0]
+        saved = dict(current, folder='/prior', work_name='Work A', glossary_path='/a.csv',
+                     tone_notes='반말', source_language='English', reading_direction='ltr',
+                     review_pages=['old.png'])
+        other = dict(saved, folder='/other', work_name='Work B', glossary_path='/b.csv', tone_notes='존댓말')
+        dialog = LocalFolderSettingsDialog(current, [saved, other, current], self.dialog)
+        self.addCleanup(dialog.deleteLater)
+        dialog.work_combo.setCurrentIndex(dialog.work_combo.findData('Work A'))
+        self.assertEqual(dialog.settings()['tone_notes'], '')
+        dialog.reuse_work()
+        self.assertEqual(dialog.settings()['work_name'], 'Work A')
+        self.assertEqual(dialog.settings()['glossary_path'], '/a.csv')
+        self.assertEqual(dialog.settings()['tone_notes'], '반말')
+        self.assertEqual(dialog.settings()['source_language'], 'Auto')
+        self.assertEqual(dialog.settings()['reading_direction'], 'auto')
+        self.assertNotIn('review_pages', dialog.settings())
+        dialog.clear_work()
+        self.assertEqual(dialog.settings()['work_name'], '')
+        self.assertEqual(dialog.settings()['tone_notes'], '')
+
+    def test_preview_only_emits_selected_folder_image_with_settings_applied(self):
+        from ballontranslator.utils.config import pcfg
+        import copy
+        folder = self._add_folder(source='English')
+        image = folder / 'page.png'
+        image.write_bytes(b'image')
+        self.dialog.queue.jobs[0].update(work_name='Work A', tone_notes='반말', reading_direction='ltr', glossary_path='/a.csv')
+        requested = []
+        self.dialog.preview_requested.connect(requested.append)
+        with patch.object(pcfg, 'module', copy.deepcopy(pcfg.module)), patch(
+            'ballontranslator.ui.local_workspace.save_config', return_value=True,
+        ), patch('ballontranslator.ui.local_workspace.QFileDialog.getOpenFileName', return_value=(str(image), '')):
+            self.dialog.preview_selected()
+            self.assertEqual(pcfg.module.translate_source, 'English')
+            self.assertEqual(pcfg.module.local_work_name, 'Work A')
+            self.assertEqual(pcfg.module.local_tone_notes, '반말')
+            self.assertEqual(pcfg.module.local_reading_direction, 'ltr')
+            self.assertEqual(pcfg.module.llm_glossary_path, '/a.csv')
+        self.assertEqual(requested, [str(image)])
+        outside = Path(self.tmp.name) / 'outside.png'
+        outside.write_bytes(b'image')
+        with patch('ballontranslator.ui.local_workspace.QFileDialog.getOpenFileName', return_value=(str(outside), '')):
+            self.dialog.preview_selected()
+        self.assertEqual(requested, [str(image)])
+
+    def test_parent_save_precedes_folder_settings_and_failure_blocks_action(self):
+        from ballontranslator.utils.config import pcfg
+        import copy
+        folder = self._add_folder(source='English')
+        parent = QWidget()
+        self.addCleanup(parent.deleteLater)
+        self.dialog.setParent(parent)
+        old_sources = []
+        parent.conditional_save = Mock(side_effect=lambda: old_sources.append(pcfg.module.translate_source) or True)
+        with patch.object(pcfg, 'module', copy.deepcopy(pcfg.module)), patch(
+            'ballontranslator.ui.local_workspace.save_config', return_value=True,
+        ):
+            pcfg.module.translate_source = '日本語'
+            self.assertTrue(self.dialog._prepare_folder_action(str(folder)))
+            self.assertEqual(old_sources, ['日本語'])
+            self.assertEqual(pcfg.module.translate_source, 'English')
+            parent.conditional_save.return_value = False
+            parent.conditional_save.side_effect = None
+            pcfg.module.translate_source = '日本語'
+            self.assertFalse(self.dialog._prepare_folder_action(str(folder)))
+            self.assertEqual(pcfg.module.translate_source, '日本語')
+        self.dialog.setParent(None)
+
+    def test_review_of_open_folder_remains_available_when_layout_holds_save(self):
+        folder = self._add_folder()
+        parent = QWidget()
+        self.addCleanup(parent.deleteLater)
+        parent.imgtrans_proj = SimpleNamespace(directory=str(folder))
+        parent.conditional_save = Mock(return_value=False)
+        self.dialog.setParent(parent)
+        requested = []
+        self.dialog.review_requested.connect(requested.append)
+        self.dialog.review_selected()
+        self.assertEqual(requested, [str(folder)])
+        parent.conditional_save.assert_not_called()
+        self.dialog.setParent(None)
+
+    def test_new_actions_are_disabled_during_pipeline_and_reader_work(self):
+        self._add_folder()
+        self.dialog.running = True
+        self.dialog.set_controls()
+        for control in (self.dialog.settings_button, self.dialog.preview_button, self.dialog.review_button,
+                        self.dialog.reader_tools.read_button, self.dialog.reader_tools.merge_button):
+            self.assertFalse(control.isEnabled())
+        self.dialog.running = False
+        self.dialog.reader_tools._dialog = object()
+        self.dialog.set_controls()
+        self.assertFalse(self.dialog.preview_button.isEnabled())
+        self.dialog.reader_tools._dialog = None
+
+    def test_completed_folder_exposes_nonblocking_review_count_after_reload(self):
+        self._add_folder()
+        self.dialog.queue.jobs[0].update(state='done', review_count=3)
+        self.dialog.queue.save()
+        self.dialog.queue = LocalJobQueue(self.dialog.queue.path)
+        self.dialog.refresh_queue()
+        self.assertEqual(self.dialog.queue.jobs[0]['state'], 'done')
+        self.assertEqual(self.dialog.table.item(0, 3).text(), '완료 · 확인 3')
+
+    def test_readiness_table_scrolls_to_every_check_without_hiding_actions(self):
         self.dialog.worker = LocalSetupThread('status', self.dialog)
         self.dialog._last_operation = 'status'
-        self.dialog._worker_result = [(f'항목 {index}', False, '설정 필요') for index in range(5)]
+        self.dialog._worker_result = [(f'항목 {index}', False, '설정 필요') for index in range(7)]
         self.dialog.on_setup_finished()
         self.dialog.show()
         self.app.processEvents()
-        last_row = self.dialog.checks.visualItemRect(self.dialog.checks.item(4, 0))
+        self.assertGreater(self.dialog.checks.verticalScrollBar().maximum(), 0)
+        self.dialog.checks.scrollToBottom()
+        self.app.processEvents()
+        last_row = self.dialog.checks.visualItemRect(self.dialog.checks.item(6, 0))
         self.assertLessEqual(last_row.bottom(), self.dialog.checks.viewport().height())
-        self.assertEqual(self.dialog.checks.verticalScrollBar().maximum(), 0)
+        self.assertTrue(self.dialog.start_button.isVisible())
+        self.assertLessEqual(self.dialog.start_button.geometry().bottom(), self.dialog.rect().bottom())
 
     def test_dialog_cannot_close_while_worker_runs(self):
         blocker = threading.Event()
@@ -221,6 +411,7 @@ class LocalWorkspaceTest(unittest.TestCase):
     def _review_owner(self):
         from qtpy.QtGui import QImage
         from ballontranslator.ui.mainwindow import MainWindow
+        from ballontranslator.utils.textblock import TextBlock
         folder = Path(self.tmp.name) / 'review-comic'
         result = folder / 'result'
         result.mkdir(parents=True)
@@ -234,7 +425,7 @@ class LocalWorkspaceTest(unittest.TestCase):
         canvas.render_result_img.return_value = QImage(2, 2, QImage.Format.Format_RGB32)
         project = SimpleNamespace(
             directory=str(folder), img_valid=True, current_img='page.png',
-            pages={'page.png': []}, is_empty=False, save=Mock(),
+            pages={'page.png': [TextBlock(), TextBlock()]}, is_empty=False, save=Mock(),
             result_dir=lambda: str(result), get_result_path=lambda _: str(result / 'page.png'),
             current_has_alpha=lambda: False, get_page_progress=lambda _: True,
             failed_pages=lambda: [], mask_array=None, inpainted_array=None,
@@ -262,6 +453,7 @@ class LocalWorkspaceTest(unittest.TestCase):
         owner.pause_local_queue = lambda: MainWindow.pause_local_queue(owner)
         owner.saveCurrentPage = lambda *args, **kwargs: MainWindow.saveCurrentPage(owner, *args, **kwargs)
         owner._resume_local_pipeline = lambda: MainWindow._resume_local_pipeline(owner)
+        owner._store_local_project_settings = lambda folder: MainWindow._store_local_project_settings(owner, folder)
         owner.pageList.currentRow.return_value = 0
         return owner, result
 
@@ -406,7 +598,8 @@ class LocalWorkspaceTest(unittest.TestCase):
         MainWindow._begin_local_folder(owner, owner.imgtrans_proj.directory)
         self.assertEqual(self.dialog.queue.jobs[0]['review_pages'], [])
         self.assertEqual(LocalJobQueue(self.dialog.queue.path).jobs[0]['review_pages'], [])
-        owner.imgtrans_proj.save.assert_called_once_with(keep_exist_as_backup=True)
+        owner.imgtrans_proj.save.assert_called_with(keep_exist_as_backup=True)
+        self.assertEqual(owner.imgtrans_proj.local_settings, self.dialog.folder_settings(owner.imgtrans_proj.directory))
         owner.on_run_imgtrans.assert_called_once_with(continue_mode=False)
 
     def test_disabled_auto_layout_is_respected_except_for_existing_review(self):
@@ -721,6 +914,7 @@ class LocalWorkspaceTest(unittest.TestCase):
             module_manager=Mock(), _local_timer=Mock(),
         )
         owner._resume_local_pipeline = lambda: MainWindow._resume_local_pipeline(owner)
+        owner._store_local_project_settings = lambda folder: MainWindow._store_local_project_settings(owner, folder)
         MainWindow._begin_local_folder(owner, str(folder))
         MainWindow.poll_local_queue(owner)
         self.assertEqual(rendered, ['first.png'])
